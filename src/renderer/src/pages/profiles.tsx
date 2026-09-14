@@ -13,12 +13,23 @@ import {
 import BasePage from '@renderer/components/base/base-page'
 import { toast } from '@renderer/components/base/toast'
 import ProfileItem from '@renderer/components/profiles/profile-item'
+import PluginItem from '@renderer/components/plugins/plugin-item'
+import PluginInstallModal from '@renderer/components/plugins/plugin-install-modal'
+import EditInfoModal from '@renderer/components/profiles/edit-info-modal'
 import { useProfileConfig } from '@renderer/hooks/use-profile-config'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
-import { getFilePath, readTextFile, subStoreCollections, subStoreSubs } from '@renderer/utils/ipc'
+import { usePluginConfig } from '@renderer/hooks/use-plugin-config'
+import {
+  getFilePath,
+  readTextFile,
+  subStoreCollections,
+  subStoreSubs,
+  updatePluginProfile
+} from '@renderer/utils/ipc'
 import type { KeyboardEvent } from 'react'
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MdContentPaste, MdUnfoldMore, MdUnfoldLess } from 'react-icons/md'
+import { TbPuzzle } from 'react-icons/tb'
 import {
   DndContext,
   closestCenter,
@@ -34,6 +45,8 @@ import SubStoreIcon from '@renderer/components/base/substore-icon'
 import useSWR from 'swr'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
+import { subscribePluginFile, takePendingPluginFile } from '@renderer/utils/plugin-file-open'
+import { DEFAULT_USE_SUB_STORE } from '../../../shared/appConfig'
 
 const Profiles: React.FC = () => {
   const { t } = useTranslation()
@@ -47,20 +60,32 @@ const Profiles: React.FC = () => {
     mutateProfileConfig
   } = useProfileConfig()
   const { appConfig } = useAppConfig()
-  const { useSubStore = true, useCustomSubStore = false, customSubStoreUrl = '' } = appConfig || {}
+  const {
+    useSubStore = DEFAULT_USE_SUB_STORE,
+    useCustomSubStore = false,
+    customSubStoreUrl = ''
+  } = appConfig || {}
   const { current, items = [] } = profileConfig || {}
   const navigate = useNavigate()
   const [sortedItems, setSortedItems] = useState(items)
   const [useProxy, setUseProxy] = useState(false)
   const [authToken, setAuthToken] = useState('')
   const [userAgent, setUserAgent] = useState('')
+  const [ageSecretKey, setAgeSecretKey] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [openInfoImport, setOpenInfoImport] = useState(false)
   const [subStoreImporting, setSubStoreImporting] = useState(false)
   const [importing, setImporting] = useState(false)
   const [updating, setUpdating] = useState(false)
   const [fileOver, setFileOver] = useState(false)
   const [url, setUrl] = useState('')
   const [, setNow] = useState(new Date())
+  const { pluginConfig, mutatePluginConfig } = usePluginConfig()
+  const [showPluginImport, setShowPluginImport] = useState(false)
+  const [pluginDropFile, setPluginDropFile] = useState<File | null>(null)
+  const [pluginFileData, setPluginFileData] = useState<IPluginFilePayload | null>(null)
+  // bump per .cpx drop -> remount modal so it loads the new file even when open
+  const [pluginDropSeq, setPluginDropSeq] = useState(0)
   const isUrlEmpty = url.trim() === ''
   const sensors = useSensors(useSensor(PointerSensor))
   const { data: subs = [], mutate: mutateSubs } = useSWR(
@@ -137,11 +162,13 @@ const Profiles: React.FC = () => {
       url,
       useProxy,
       authToken: authToken || undefined,
-      userAgent: userAgent || undefined
+      userAgent: userAgent || undefined,
+      ageSecretKey: ageSecretKey || undefined
     })
     setUrl('')
     setAuthToken('')
     setUserAgent('')
+    setAgeSecretKey('')
     setImporting(false)
   }
   const pageRef = useRef<HTMLDivElement>(null)
@@ -175,6 +202,20 @@ const Profiles: React.FC = () => {
     handleImportRef.current()
   }, [])
 
+  const openPendingPluginFile = useCallback((): void => {
+    const payload = takePendingPluginFile()
+    if (!payload) return
+    setPluginDropFile(null)
+    setPluginFileData(payload)
+    setPluginDropSeq((n) => n + 1)
+    setShowPluginImport(true)
+  }, [])
+
+  useEffect(() => {
+    openPendingPluginFile()
+    return subscribePluginFile(openPendingPluginFile)
+  }, [openPendingPluginFile])
+
   useEffect(() => {
     const element = pageRef.current
     if (!element) return
@@ -196,7 +237,8 @@ const Profiles: React.FC = () => {
       event.stopPropagation()
       if (event.dataTransfer?.files) {
         const file = event.dataTransfer.files[0]
-        if (file.name.endsWith('.yml') || file.name.endsWith('.yaml')) {
+        const name = file?.name.toLowerCase() ?? ''
+        if (name.endsWith('.yml') || name.endsWith('.yaml')) {
           try {
             const path = window.api.webUtils.getPathForFile(file)
             const content = await readTextFile(path)
@@ -204,7 +246,13 @@ const Profiles: React.FC = () => {
           } catch (e) {
             toast.error(String(e))
           }
-        } else {
+        } else if (name.endsWith('.cpx')) {
+          // .cpx -> plugin install modal (preview + confirm)
+          setPluginFileData(null)
+          setPluginDropFile(file)
+          setPluginDropSeq((n) => n + 1)
+          setShowPluginImport(true)
+        } else if (file) {
           toast.warning(tRef.current('profiles.error.unsupportedFileType'))
         }
       }
@@ -236,30 +284,64 @@ const Profiles: React.FC = () => {
       ref={pageRef}
       title={t('profiles.title')}
       header={
-        <Button
-          size="sm"
-          title={t('profiles.updateAll')}
-          className="app-nodrag"
-          variant="light"
-          isIconOnly
-          onPress={async () => {
-            setUpdating(true)
-            for (const item of items) {
-              if (item.id === current) continue
-              if (item.type !== 'remote') continue
-              await addProfileItem(item)
-            }
-            const currentItem = items.find((item) => item.id === current)
-            if (currentItem && currentItem.type === 'remote') {
-              await addProfileItem(currentItem)
-            }
-            setUpdating(false)
-          }}
-        >
-          <IoMdRefresh className={`text-lg ${updating ? 'animate-spin' : ''}`} />
-        </Button>
+        <>
+          <Button
+            size="sm"
+            title={t('plugins.title')}
+            isIconOnly
+            variant="light"
+            className="app-nodrag"
+            onPress={() => {
+              setPluginDropFile(null)
+              setPluginFileData(null)
+              setShowPluginImport(true)
+            }}
+          >
+            <TbPuzzle className="text-lg" />
+          </Button>
+          <Button
+            size="sm"
+            title={t('profiles.updateAll')}
+            className="app-nodrag"
+            variant="light"
+            isIconOnly
+            onPress={async () => {
+              setUpdating(true)
+              for (const item of items) {
+                if (item.id === current) continue
+                if (item.type === 'remote') await addProfileItem(item)
+                else if (item.type === 'plugin' && item.pluginId)
+                  await updatePluginProfile(item.pluginId, true)
+              }
+              const currentItem = items.find((item) => item.id === current)
+              if (currentItem && currentItem.type === 'remote') {
+                await addProfileItem(currentItem)
+              } else if (currentItem?.type === 'plugin' && currentItem.pluginId) {
+                await updatePluginProfile(currentItem.pluginId, true)
+              }
+              setUpdating(false)
+            }}
+          >
+            <IoMdRefresh className={`text-lg ${updating ? 'animate-spin' : ''}`} />
+          </Button>
+        </>
       }
     >
+      {openInfoImport && (
+        <EditInfoModal
+          mode="import"
+          item={{
+            id: '',
+            name: '',
+            type: 'remote',
+            url: '',
+            override: [],
+            useProxy
+          }}
+          addProfileItem={addProfileItem}
+          onClose={() => setOpenInfoImport(false)}
+        />
+      )}
       <div className="sticky profiles-sticky top-0 z-40 bg-background">
         <div className="flex flex-col gap-2 p-2">
           <div className="flex gap-2">
@@ -285,9 +367,11 @@ const Profiles: React.FC = () => {
                   >
                     <MdContentPaste className="text-lg" />
                   </Button>
+                  {/* p-0 m-0 覆盖 HeroUI 默认的 `p-2 -m-2`：负外边距会把点击热区外扩 8px，
+                      正好盖住左边只有 mr-2 间距的粘贴按钮，导致点按钮变成切换代理开关 */}
                   <Checkbox
-                    className="whitespace-nowrap"
-                    checked={useProxy}
+                    className="whitespace-nowrap p-0 m-0"
+                    isSelected={useProxy}
                     onValueChange={setUseProxy}
                   >
                     {t('profiles.useProxy')}
@@ -424,9 +508,12 @@ const Profiles: React.FC = () => {
                       type: 'local',
                       file: 'proxies: []\nproxy-groups: []\nrules: []'
                     })
+                  } else if (key === 'import') {
+                    setOpenInfoImport(true)
                   }
                 }}
               >
+                <DropdownItem key="import">{t('profiles.import')}</DropdownItem>
                 <DropdownItem key="open">{t('profiles.open')}</DropdownItem>
                 <DropdownItem key="new">{t('profiles.new')}</DropdownItem>
               </DropdownMenu>
@@ -451,11 +538,41 @@ const Profiles: React.FC = () => {
                 onKeyUp={handleInputKeyUp}
                 className="flex-1"
               />
+              <Input
+                size="sm"
+                type="password"
+                placeholder={t('profiles.editInfo.ageSecretKeyPlaceholder')}
+                value={ageSecretKey}
+                onValueChange={setAgeSecretKey}
+                onKeyUp={handleInputKeyUp}
+                className="flex-1"
+              />
             </div>
           )}
         </div>
         <Divider />
       </div>
+
+      {showPluginImport && (
+        <PluginInstallModal
+          key={pluginDropSeq}
+          initialFile={pluginDropFile ?? undefined}
+          initialData={pluginFileData ?? undefined}
+          onClose={() => {
+            setShowPluginImport(false)
+            setPluginDropFile(null)
+            setPluginFileData(null)
+            mutatePluginConfig()
+          }}
+        />
+      )}
+      {(pluginConfig?.items?.length ?? 0) > 0 && (
+        <div className="px-2 mt-2 mb-3 grid grid-cols-1 gap-2">
+          {pluginConfig?.items?.map((p) => (
+            <PluginItem key={p.id} item={p} onChanged={mutatePluginConfig} />
+          ))}
+        </div>
+      )}
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
         <div
           className={`${fileOver ? 'blur-sm' : ''} grid sm:grid-cols-2 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2 m-2`}

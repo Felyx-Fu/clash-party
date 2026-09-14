@@ -1,116 +1,85 @@
 import { useTheme } from 'next-themes'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react'
 import { NavigateFunction, useLocation, useNavigate, useRoutes } from 'react-router-dom'
 import OutboundModeSwitcher from '@renderer/components/sider/outbound-mode-switcher'
-import SysproxySwitcher from '@renderer/components/sider/sysproxy-switcher'
-import TunSwitcher from '@renderer/components/sider/tun-switcher'
 import { Button, Divider } from '@heroui/react'
 import { IoSettings } from 'react-icons/io5'
-import routes from '@renderer/routes'
-import {
-  DndContext,
-  closestCorners,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  DragEndEvent
-} from '@dnd-kit/core'
-import { SortableContext } from '@dnd-kit/sortable'
-import ProfileCard from '@renderer/components/sider/profile-card'
-import ProxyCard from '@renderer/components/sider/proxy-card'
-import RuleCard from '@renderer/components/sider/rule-card'
-import DNSCard from '@renderer/components/sider/dns-card'
-import SniffCard from '@renderer/components/sider/sniff-card'
-import OverrideCard from '@renderer/components/sider/override-card'
-import ConnCard from '@renderer/components/sider/conn-card'
-import LogCard from '@renderer/components/sider/log-card'
-import MihomoCoreCard from '@renderer/components/sider/mihomo-core-card'
-import ResourceCard from '@renderer/components/sider/resource-card'
+import routes, { useDeferredRoutePreload } from '@renderer/routes'
 import UpdaterButton from '@renderer/components/updater/updater-button'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import { applyTheme, setNativeTheme, setTitleBarOverlay } from '@renderer/utils/ipc'
 import { platform } from '@renderer/utils/init'
 import { TitleBarOverlayOptions } from 'electron'
-import SubStoreCard from '@renderer/components/sider/substore-card'
-import NetworkCard from '@renderer/components/sider/network-card'
-import UsageCard from '@renderer/components/sider/usage-card'
 import { useTrafficLogger } from '@renderer/hooks/use-traffic-logger'
+import { useDnsOverrideAutoDisabledNotice } from '@renderer/hooks/use-dns-override-notice'
 import { createTourDriver, getDriver, startTourIfNeeded } from '@renderer/utils/tour'
+import { hasPendingPluginFile, subscribePluginFile } from '@renderer/utils/plugin-file-open'
 import 'driver.js/dist/driver.css'
 import { useTranslation } from 'react-i18next'
+import { DEFAULT_ENABLE_TRAFFIC_LOGGER } from '../../shared/appConfig'
 import MihomoIcon from './components/base/mihomo-icon'
-
-let navigate: NavigateFunction
+import { getSiderCardByPath } from './utils/sider'
+import { markInitialContentPartReady } from './utils/startup'
 
 export { getDriver }
 
-const ALL_SIDER_KEYS = [
-  'sysproxy',
-  'tun',
-  'profile',
-  'proxy',
-  'rule',
-  'resource',
-  'override',
-  'connection',
-  'mihomo',
-  'dns',
-  'sniff',
-  'log',
-  'substore',
-  'network',
-  'usage'
-]
+const siderCardsPromise = import('@renderer/components/sider/sider-cards')
+const SiderCards = lazy(() => siderCardsPromise)
 
-function mergeSiderOrder(saved: string[]): string[] {
-  const valid = saved.filter((k) => ALL_SIDER_KEYS.includes(k))
-  const missing = ALL_SIDER_KEYS.filter((k) => !valid.includes(k))
-  return [...valid, ...missing]
+const FirstContentReady: React.FC = () => {
+  const { appConfig } = useAppConfig()
+  const location = useLocation()
+  const sent = useRef(false)
+
+  useEffect(() => {
+    const ready = Boolean(appConfig) && location.pathname !== '/'
+    if (!ready || sent.current) return
+    sent.current = true
+    markInitialContentPartReady('route')
+  }, [appConfig, location.pathname])
+
+  return null
 }
 
 const App: React.FC = () => {
   const { t } = useTranslation()
-  useTrafficLogger()
   const { appConfig, patchAppConfig } = useAppConfig()
+  const hasAppConfig = Boolean(appConfig)
   const {
+    enableTrafficLogger = DEFAULT_ENABLE_TRAFFIC_LOGGER,
     appTheme = 'system',
     customTheme,
     useWindowFrame = false,
     siderWidth = 250,
-    siderOrder = [
-      'sysproxy',
-      'tun',
-      'profile',
-      'proxy',
-      'rule',
-      'resource',
-      'override',
-      'connection',
-      'mihomo',
-      'dns',
-      'sniff',
-      'log',
-      'substore',
-      'network',
-      'usage'
-    ]
+    lastSelectedSiderCard = 'proxy',
+    rememberSelectedSiderCard = false
   } = appConfig || {}
+  useTrafficLogger(enableTrafficLogger)
+  useDnsOverrideAutoDisabledNotice()
   const narrowWidth = platform === 'darwin' ? 70 : 60
-  const [order, setOrder] = useState(mergeSiderOrder(siderOrder))
   const [siderWidthValue, setSiderWidthValue] = useState(siderWidth)
   const siderWidthValueRef = useRef(siderWidthValue)
   const [resizing, setResizing] = useState(false)
   const resizingRef = useRef(resizing)
   const tourInitialized = useRef(false)
-  const sensors = useSensors(useSensor(PointerSensor))
+  useDeferredRoutePreload()
   const { setTheme, systemTheme } = useTheme()
-  navigate = useNavigate()
+  const navigate: NavigateFunction = useNavigate()
   const location = useLocation()
   const page = useRoutes(routes)
 
+  useEffect(() => {
+    const openPluginImport = (): void => {
+      navigate('/profiles')
+    }
+    const unsubscribe = subscribePluginFile(openPluginImport)
+    if (hasPendingPluginFile()) openPluginImport()
+    return unsubscribe
+  }, [navigate])
+
   const setTitlebar = useCallback((): void => {
     if (!useWindowFrame && platform !== 'darwin') {
-      const options = { height: 48 } as TitleBarOverlayOptions
+      const options = { height: 47 } as TitleBarOverlayOptions
       try {
         options.color = window.getComputedStyle(document.documentElement).backgroundColor
         options.symbolColor = window.getComputedStyle(document.documentElement).color
@@ -122,9 +91,22 @@ const App: React.FC = () => {
   }, [useWindowFrame])
 
   useEffect(() => {
-    setOrder(mergeSiderOrder(siderOrder))
     setSiderWidthValue(siderWidth)
-  }, [siderOrder, siderWidth])
+  }, [siderWidth])
+
+  useEffect(() => {
+    if (!hasAppConfig) return
+    if (!rememberSelectedSiderCard) return
+    const currentSiderCard = getSiderCardByPath(location.pathname)
+    if (!currentSiderCard || currentSiderCard === lastSelectedSiderCard) return
+    patchAppConfig({ lastSelectedSiderCard: currentSiderCard })
+  }, [
+    hasAppConfig,
+    rememberSelectedSiderCard,
+    lastSelectedSiderCard,
+    location.pathname,
+    patchAppConfig
+  ])
 
   useEffect(() => {
     siderWidthValueRef.current = siderWidthValue
@@ -144,7 +126,7 @@ const App: React.FC = () => {
       createTourDriver(t, navigate)
       startTourIfNeeded()
     }
-  }, [t])
+  }, [t, navigate])
 
   useEffect(() => {
     setNativeTheme(appTheme)
@@ -163,60 +145,6 @@ const App: React.FC = () => {
     return (): void => window.removeEventListener('mouseup', onResizeEnd)
   }, [onResizeEnd])
 
-  const onDragEnd = async (event: DragEndEvent): Promise<void> => {
-    const { active, over } = event
-    if (over) {
-      if (active.id !== over.id) {
-        const newOrder = order.slice()
-        const activeIndex = newOrder.indexOf(active.id as string)
-        const overIndex = newOrder.indexOf(over.id as string)
-        newOrder.splice(activeIndex, 1)
-        newOrder.splice(overIndex, 0, active.id as string)
-        setOrder(newOrder)
-        await patchAppConfig({ siderOrder: newOrder })
-        return
-      }
-    }
-    const dest = navigateMap[active.id as string]
-    if (dest) navigate(dest)
-  }
-
-  const navigateMap = {
-    sysproxy: 'sysproxy',
-    tun: 'tun',
-    profile: 'profiles',
-    proxy: 'proxies',
-    mihomo: 'mihomo',
-    connection: 'connections',
-    dns: 'dns',
-    sniff: 'sniffer',
-    log: 'logs',
-    rule: 'rules',
-    resource: 'resources',
-    override: 'override',
-    substore: 'substore',
-    network: 'network',
-    usage: 'traffic'
-  }
-
-  const componentMap = {
-    sysproxy: SysproxySwitcher,
-    tun: TunSwitcher,
-    profile: ProfileCard,
-    proxy: ProxyCard,
-    mihomo: MihomoCoreCard,
-    connection: ConnCard,
-    dns: DNSCard,
-    sniff: SniffCard,
-    log: LogCard,
-    rule: RuleCard,
-    resource: ResourceCard,
-    override: OverrideCard,
-    substore: SubStoreCard,
-    network: NetworkCard,
-    usage: UsageCard
-  }
-
   return (
     <div
       onMouseMove={(e) => {
@@ -234,21 +162,16 @@ const App: React.FC = () => {
       className={`w-full h-screen flex ${resizing ? 'cursor-ew-resize' : ''}`}
     >
       {siderWidthValue === narrowWidth ? (
-        <div style={{ width: `${narrowWidth}px` }} className="side h-full">
-          <div className="app-drag flex justify-center items-center z-40 bg-transparent h-12.25">
+        <div style={{ width: `${narrowWidth}px` }} className="side h-full flex flex-col">
+          <div className="app-drag flex shrink-0 justify-center items-center z-40 bg-transparent h-11.25">
             {platform !== 'darwin' && <MihomoIcon className="h-8 leading-8 text-lg mx-px" />}
+          </div>
+          <Suspense fallback={<div className="min-h-0 flex-1" />}>
+            <SiderCards iconOnly />
+          </Suspense>
+          <div className="px-2 pt-2 pb-4 flex shrink-0 flex-col items-center space-y-2">
             <UpdaterButton iconOnly={true} />
-          </div>
-          <div className="h-[calc(100%-110px)] overflow-y-auto no-scrollbar">
-            <div className="h-full w-full flex flex-col gap-2">
-              {order.map((key: string) => {
-                const Component = componentMap[key]
-                if (!Component) return null
-                return <Component key={key} iconOnly={true} />
-              })}
-            </div>
-          </div>
-          <div className="mt-2 flex justify-center items-center h-12">
+            <OutboundModeSwitcher iconOnly />
             <Button
               size="sm"
               className="app-nodrag"
@@ -294,19 +217,9 @@ const App: React.FC = () => {
           <div className="mt-2 mx-2">
             <OutboundModeSwitcher />
           </div>
-          <div style={{ overflowX: 'clip' }}>
-            <DndContext sensors={sensors} collisionDetection={closestCorners} onDragEnd={onDragEnd}>
-              <div className="grid grid-cols-2 gap-2 m-2">
-                <SortableContext items={order}>
-                  {order.map((key: string) => {
-                    const Component = componentMap[key]
-                    if (!Component) return null
-                    return <Component key={key} />
-                  })}
-                </SortableContext>
-              </div>
-            </DndContext>
-          </div>
+          <Suspense fallback={null}>
+            <SiderCards />
+          </Suspense>
         </div>
       )}
 
@@ -329,7 +242,10 @@ const App: React.FC = () => {
         style={{ width: `calc(100% - ${siderWidthValue + 1}px)` }}
         className="main grow h-full overflow-y-auto"
       >
-        {page}
+        <Suspense fallback={<div className="h-full w-full bg-content1" />}>
+          {page}
+          <FirstContentReady />
+        </Suspense>
       </div>
     </div>
   )

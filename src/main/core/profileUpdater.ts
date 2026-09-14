@@ -1,12 +1,18 @@
 import { Cron } from 'croner'
-import { addProfileItem, getCurrentProfileItem, getProfileConfig, getProfileItem } from '../config'
+import {
+  addProfileItem,
+  getAppConfig,
+  getCurrentProfileItem,
+  getProfileConfig,
+  getProfileItem
+} from '../config'
 import { logger } from '../utils/logger'
 
 const intervalPool: Record<string, Cron | NodeJS.Timeout> = {}
 const delayedUpdatePool: Record<string, NodeJS.Timeout> = {}
 const updatingProfileIds = new Set<string>()
 
-// 定时触发的订阅刷新至少间隔1分钟
+// 定时触发的订阅刷新至少间隔 1 分钟
 const MIN_INTERVAL_MS = 60 * 1000
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 
@@ -29,9 +35,26 @@ async function updateProfile(id: string): Promise<void> {
     const item = await getProfileItem(id)
     if (item && item.type === 'remote') {
       await addProfileItem(item)
+      // 后台定时更新完成后主动通知渲染层，否则订阅列表的更新时间/流量要等窗口重新聚焦才刷新（#1570）
+      // 动态 import 避免与 window.ts 形成静态循环依赖
+      const { mainWindow } = await import('../window')
+      mainWindow?.webContents.send('profileConfigUpdated')
+    } else if (item && item.type === 'plugin' && item.pluginId) {
+      const { updatePluginProfile } = await import('../resolve/plugin')
+      await updatePluginProfile(item.pluginId)
     }
   } finally {
     updatingProfileIds.delete(id)
+  }
+}
+
+async function auditPluginProfileVault(item: IProfileItem): Promise<void> {
+  if (item.type !== 'plugin' || !item.pluginId) return
+  try {
+    const { auditPluginVault } = await import('../resolve/plugin')
+    await auditPluginVault(item.pluginId)
+  } catch (e) {
+    await logger.warn(`[ProfileUpdater] Failed to audit plugin vault ${item.pluginId}:`, e)
   }
 }
 
@@ -46,7 +69,8 @@ function updateTask(itemId: string, logLabel: string): () => Promise<void> {
 }
 
 function scheduleProfileUpdate(item: IProfileItem): void {
-  if (item.type !== 'remote' || !item.autoUpdate || !item.interval) return
+  if ((item.type !== 'remote' && item.type !== 'plugin') || !item.autoUpdate || !item.interval)
+    return
 
   const itemId = item.id
   const logLabel = `profile ${itemId}`
@@ -88,33 +112,55 @@ function scheduleDelayedCurrentUpdate(item: IProfileItem): void {
 }
 
 export async function initProfileUpdater(): Promise<void> {
+  const { autoUpdateProfileOnStart = true } = await getAppConfig()
   const { items = [], current } = await getProfileConfig()
   const currentItem = await getCurrentProfileItem()
 
   for (const item of items.filter((i) => i.id !== current)) {
+    await auditPluginProfileVault(item)
+
     if (item.type === 'remote' && item.autoUpdate && item.interval) {
       await addProfileUpdater(item)
 
-      try {
-        await addProfileItem(item)
-      } catch (e) {
-        await logger.warn(`[ProfileUpdater] Failed to init profile ${item.name}:`, e)
+      if (autoUpdateProfileOnStart) {
+        try {
+          await addProfileItem(item)
+        } catch (e) {
+          await logger.warn(`[ProfileUpdater] Failed to init profile ${item.name}:`, e)
+        }
       }
     }
+
+    if (item.type === 'plugin' && item.autoUpdate && item.interval) {
+      await addProfileUpdater(item)
+    }
   }
+
+  await auditPluginProfileVault(currentItem)
 
   if (currentItem?.type === 'remote' && currentItem.autoUpdate && currentItem.interval) {
     const currentId = currentItem.id
     await addProfileUpdater(currentItem)
 
-    try {
-      await addProfileItem(currentItem)
-    } catch (e) {
-      await logger.warn(`[ProfileUpdater] Failed to init current profile:`, e)
+    if (autoUpdateProfileOnStart) {
+      try {
+        await addProfileItem(currentItem)
+      } catch (e) {
+        await logger.warn(`[ProfileUpdater] Failed to init current profile:`, e)
+      }
     }
 
     const latestCurrentItem = (await getProfileItem(currentId)) ?? currentItem
     scheduleDelayedCurrentUpdate(latestCurrentItem)
+  }
+
+  if (
+    currentItem?.type === 'plugin' &&
+    currentItem.autoUpdate &&
+    currentItem.interval &&
+    currentItem.id !== 'default'
+  ) {
+    await addProfileUpdater(currentItem)
   }
 }
 

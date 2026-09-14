@@ -1,4 +1,4 @@
-import { mkdir, writeFile, rm, readdir, cp, stat, rename } from 'fs/promises'
+import { mkdir, rm, readdir, cp, stat, rename } from 'fs/promises'
 import { existsSync } from 'fs'
 import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
@@ -7,7 +7,9 @@ import { app, dialog } from 'electron'
 import {
   startPacServer,
   startSubStoreBackendServer,
-  startSubStoreFrontendServer
+  startSubStoreFrontendServer,
+  subStorePort,
+  subStoreFrontendPort
 } from '../resolve/server'
 import { triggerSysProxy } from '../sys/sysproxy'
 import {
@@ -18,6 +20,11 @@ import {
 } from '../config'
 import { startSSIDCheck } from '../sys/ssid'
 import i18next, { resources } from '../../shared/i18n'
+import {
+  DEFAULT_MIHOMO_LAN_ALLOWED_IPS,
+  DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES,
+  getDefaultMihomoTunDevice
+} from '../../shared/appConfig'
 import { stringify } from './yaml'
 import {
   defaultConfig,
@@ -44,11 +51,19 @@ import {
   themesDir
 } from './dirs'
 import { initLogger } from './logger'
+import { atomicWriteFile } from './safeFile'
 
 let isInitBasicCompleted = false
 let isRuntimeFilesCompleted = false
 let initBasicPromise: Promise<void> | null = null
 let runtimeFilesPromise: Promise<void> | null = null
+let subStoreServicesPromise: Promise<SubStoreServicePorts> | null = null
+let subStoreServicesStarted = false
+
+interface SubStoreServicePorts {
+  backendPort?: number
+  frontendPort?: number
+}
 
 export function safeShowErrorBox(titleKey: string, message: string): void {
   let title: string
@@ -135,7 +150,7 @@ async function initConfig(): Promise<void> {
   await Promise.all(
     configs.map(async (config) => {
       if (!existsSync(config.path)) {
-        await writeFile(config.path, stringify(config.content))
+        await atomicWriteFile(config.path, stringify(config.content))
       }
     })
   )
@@ -232,6 +247,10 @@ async function initFiles(): Promise<void> {
     },
     {
       name: 'ASN.mmdb',
+      targetDirs: [mihomoWorkDir(), mihomoTestDir()]
+    },
+    {
+      name: 'BundleMRS.7z',
       targetDirs: [mihomoWorkDir(), mihomoTestDir()]
     },
     {
@@ -348,15 +367,14 @@ async function migrateMihomoConfig(): Promise<void> {
 
   // skip-auth-prefixes
   if (!config['skip-auth-prefixes']) {
-    patches['skip-auth-prefixes'] = ['127.0.0.1/32', '::1/128']
+    patches['skip-auth-prefixes'] = [...DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES]
   } else if (
     config['skip-auth-prefixes'].length >= 1 &&
-    config['skip-auth-prefixes'][0] === '127.0.0.1/32' &&
-    !config['skip-auth-prefixes'].includes('::1/128')
+    config['skip-auth-prefixes'][0] === DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES[0] &&
+    !config['skip-auth-prefixes'].includes(DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES[1])
   ) {
     patches['skip-auth-prefixes'] = [
-      '127.0.0.1/32',
-      '::1/128',
+      ...DEFAULT_MIHOMO_SKIP_AUTH_PREFIXES,
       ...config['skip-auth-prefixes'].slice(1)
     ]
   }
@@ -364,14 +382,14 @@ async function migrateMihomoConfig(): Promise<void> {
   // 其他默认值
   if (!config.authentication) patches.authentication = []
   if (!config['bind-address']) patches['bind-address'] = '*'
-  if (!config['lan-allowed-ips']) patches['lan-allowed-ips'] = ['0.0.0.0/0', '::/0']
+  if (!config['lan-allowed-ips']) patches['lan-allowed-ips'] = [...DEFAULT_MIHOMO_LAN_ALLOWED_IPS]
   if (!config['lan-disallowed-ips']) patches['lan-disallowed-ips'] = []
 
   // tun device
   if (!config.tun?.device || (process.platform === 'darwin' && config.tun.device === 'Mihomo')) {
     patches.tun = {
       ...config.tun,
-      device: process.platform === 'darwin' ? 'utun1500' : 'Mihomo'
+      device: getDefaultMihomoTunDevice(process.platform)
     }
   }
 
@@ -468,7 +486,25 @@ export async function init(): Promise<void> {
   initDeeplink()
 }
 
-export async function startSubStoreServices(): Promise<void> {
-  await ensureRuntimeFiles()
-  await Promise.all([startSubStoreFrontendServer(), startSubStoreBackendServer()])
+export async function startSubStoreServices(): Promise<SubStoreServicePorts> {
+  if (subStoreServicesStarted) {
+    return { backendPort: subStorePort, frontendPort: subStoreFrontendPort }
+  }
+  if (subStoreServicesPromise) return subStoreServicesPromise
+
+  subStoreServicesPromise = (async () => {
+    await ensureRuntimeFiles()
+    await Promise.all([startSubStoreFrontendServer(), startSubStoreBackendServer()])
+    subStoreServicesStarted = true
+    return {
+      backendPort: subStorePort,
+      frontendPort: subStoreFrontendPort
+    }
+  })()
+
+  try {
+    return await subStoreServicesPromise
+  } finally {
+    subStoreServicesPromise = null
+  }
 }

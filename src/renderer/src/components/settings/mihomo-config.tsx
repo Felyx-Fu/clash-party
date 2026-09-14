@@ -2,19 +2,32 @@ import React, { useState } from 'react'
 import { toast } from '@renderer/components/base/toast'
 import { Button, Input, Select, SelectItem, Switch, Tooltip } from '@heroui/react'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
+import { useProfileConfig } from '@renderer/hooks/use-profile-config'
 import debounce from '@renderer/utils/debounce'
-import { getGistUrl, restartCore } from '@renderer/utils/ipc'
+import {
+  exportGistAgeSecretKey,
+  generateGistAgeKeyPair,
+  getGistUrl,
+  restartCore
+} from '@renderer/utils/ipc'
 import { MdDeleteForever } from 'react-icons/md'
-import { BiCopy } from 'react-icons/bi'
+import { BiCopy, BiDownload, BiKey } from 'react-icons/bi'
 import { IoIosHelpCircle } from 'react-icons/io'
 import { platform, version } from '@renderer/utils/init'
 import { useTranslation } from 'react-i18next'
 import SettingItem from '../base/base-setting-item'
 import SettingCard from '../base/base-setting-card'
 
+interface SsidProfileEntry {
+  ssid: string
+  profileId: string
+}
+
 const MihomoConfig: React.FC = () => {
   const { t } = useTranslation()
   const { appConfig, patchAppConfig } = useAppConfig()
+  const { profileConfig } = useProfileConfig()
+  const { items: profileItems = [] } = profileConfig || {}
   const {
     diffWorkDir = false,
     useHotReloadProfile = false,
@@ -22,6 +35,9 @@ const MihomoConfig: React.FC = () => {
     delayTestConcurrency,
     delayTestTimeout,
     githubToken = '',
+    gistAgeEncrypt = false,
+    gistAgeRecipient = '',
+    gistAgeSecretKey = '',
     autoCloseConnection = true,
     testProfileOnStart = true,
     pauseSSID = [],
@@ -30,10 +46,19 @@ const MihomoConfig: React.FC = () => {
     userAgent,
     subscriptionTimeout = 30000,
     mihomoCpuPriority = 'PRIORITY_NORMAL',
-    proxyCols = 'auto'
+    coreStartupMode = 'log',
+    proxyCols = 'auto',
+    ssidProfileMap = {},
+    ssidProfileRestore = false
   } = appConfig || {}
   const [url, setUrl] = useState(delayTestUrl)
   const [pauseSSIDInput, setPauseSSIDInput] = useState(pauseSSID)
+  const [ssidProfileEntriesInput, setSsidProfileEntriesInput] = useState<SsidProfileEntry[]>(() =>
+    Object.entries(ssidProfileMap).map(([ssid, profileId]) => ({
+      ssid,
+      profileId
+    }))
+  )
   const setUrlDebounce = debounce((v: string) => {
     patchAppConfig({ delayTestUrl: v })
   }, 500)
@@ -41,6 +66,65 @@ const MihomoConfig: React.FC = () => {
   const setUaDebounce = debounce((v: string) => {
     patchAppConfig({ userAgent: v })
   }, 500)
+  const [isGeneratingGistAgeKey, setIsGeneratingGistAgeKey] = useState(false)
+  const [isExportingGistAgeKey, setIsExportingGistAgeKey] = useState(false)
+  const handleGenerateGistAgeKeyPair = async (): Promise<void> => {
+    if (gistAgeSecretKey && !window.confirm(t('mihomo.gist.ageGenerateConfirm'))) return
+
+    setIsGeneratingGistAgeKey(true)
+    try {
+      const { secretKey, recipient } = await generateGistAgeKeyPair()
+      await patchAppConfig({
+        gistAgeEncrypt: true,
+        gistAgeRecipient: recipient,
+        gistAgeSecretKey: secretKey
+      })
+      toast.success(t('mihomo.gist.generateKeyPairSuccess'))
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setIsGeneratingGistAgeKey(false)
+    }
+  }
+  const handleExportGistAgeSecretKey = async (): Promise<void> => {
+    setIsExportingGistAgeKey(true)
+    try {
+      const exported = await exportGistAgeSecretKey()
+      if (exported) toast.success(t('mihomo.gist.exportPrivateKeySuccess'))
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setIsExportingGistAgeKey(false)
+    }
+  }
+  const handleCopyGistAgeSecretKey = async (): Promise<void> => {
+    if (!gistAgeSecretKey) return
+    await navigator.clipboard.writeText(gistAgeSecretKey)
+    toast.success(t('mihomo.gist.copyPrivateKeySuccess'))
+  }
+  const handleSaveSsidProfileMap = (entries: SsidProfileEntry[]): void => {
+    const map: Record<string, string> = {}
+    entries.forEach((entry) => {
+      if (entry.ssid.trim()) {
+        map[entry.ssid.trim()] = entry.profileId
+      }
+    })
+    setSsidProfileEntriesInput(entries)
+    patchAppConfig({ ssidProfileMap: map })
+  }
+
+  const hasSsidProfileChanges = (): boolean => {
+    const currentMap: Record<string, string> = {}
+    ssidProfileEntriesInput.forEach((entry) => {
+      if (entry.ssid.trim()) {
+        currentMap[entry.ssid.trim()] = entry.profileId
+      }
+    })
+    if (Object.keys(currentMap).length !== Object.keys(ssidProfileMap).length) return true
+    return Object.entries(currentMap).some(
+      ([ssid, profileId]) => ssidProfileMap[ssid] !== profileId
+    )
+  }
   return (
     <SettingCard>
       <SettingItem title={t('mihomo.userAgent')} divider>
@@ -63,7 +147,11 @@ const MihomoConfig: React.FC = () => {
             type="number"
             value={(subscriptionTimeout / 1000)?.toString()}
             onValueChange={async (v: string) => {
-              const num = parseInt(v)
+              // 清空输入框时 parseInt('') 是 NaN，NaN * 1000 仍是 NaN，
+              // 经 IPC 序列化后会以 null 落盘。onBlur 只在失焦时纠正，
+              // 中间这段时间配置里已经是坏值，所以这里直接不写。
+              const num = parseInt(v, 10)
+              if (!Number.isFinite(num)) return
               await patchAppConfig({ subscriptionTimeout: num * 1000 })
             }}
             onBlur={async (e) => {
@@ -96,7 +184,9 @@ const MihomoConfig: React.FC = () => {
           value={delayTestConcurrency?.toString()}
           placeholder={t('mihomo.delayTest.concurrencyPlaceholder')}
           onValueChange={(v) => {
-            patchAppConfig({ delayTestConcurrency: parseInt(v) })
+            const num = parseInt(v, 10)
+            if (!Number.isFinite(num)) return
+            patchAppConfig({ delayTestConcurrency: num })
           }}
         />
       </SettingItem>
@@ -108,7 +198,9 @@ const MihomoConfig: React.FC = () => {
           value={delayTestTimeout?.toString()}
           placeholder={t('mihomo.delayTest.timeoutPlaceholder')}
           onValueChange={(v) => {
-            patchAppConfig({ delayTestTimeout: parseInt(v) })
+            const num = parseInt(v, 10)
+            if (!Number.isFinite(num)) return
+            patchAppConfig({ delayTestTimeout: num })
           }}
         />
       </SettingItem>
@@ -146,6 +238,72 @@ const MihomoConfig: React.FC = () => {
             patchAppConfig({ githubToken: v })
           }}
         />
+      </SettingItem>
+      <SettingItem
+        title={t('mihomo.gist.ageEncrypt')}
+        actions={
+          <Tooltip content={<div className="max-w-80">{t('mihomo.gist.ageEncryptTooltip')}</div>}>
+            <Button isIconOnly size="sm" variant="light">
+              <IoIosHelpCircle className="text-lg" />
+            </Button>
+          </Tooltip>
+        }
+        divider
+      >
+        <Switch
+          size="sm"
+          isSelected={gistAgeEncrypt}
+          onValueChange={(v) => {
+            patchAppConfig({ gistAgeEncrypt: v })
+          }}
+        />
+      </SettingItem>
+      <SettingItem title={t('mihomo.gist.ageRecipient')} divider>
+        <Input
+          size="sm"
+          className="w-[60%]"
+          value={gistAgeRecipient}
+          placeholder={t('mihomo.gist.ageRecipientPlaceholder')}
+          isDisabled={!gistAgeEncrypt}
+          onValueChange={(v) => {
+            patchAppConfig({ gistAgeRecipient: v })
+          }}
+        />
+      </SettingItem>
+      <SettingItem title={t('mihomo.gist.ageKeys')} divider>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="flat"
+            isLoading={isGeneratingGistAgeKey}
+            startContent={<BiKey className="text-base" />}
+            onPress={handleGenerateGistAgeKeyPair}
+          >
+            {t('mihomo.gist.generateKeyPair')}
+          </Button>
+          <Button
+            size="sm"
+            variant="flat"
+            isDisabled={!gistAgeSecretKey}
+            isLoading={isExportingGistAgeKey}
+            startContent={<BiDownload className="text-base" />}
+            onPress={handleExportGistAgeSecretKey}
+          >
+            {t('mihomo.gist.exportPrivateKey')}
+          </Button>
+          <Tooltip content={t('mihomo.gist.copyPrivateKey')}>
+            <Button
+              title={t('mihomo.gist.copyPrivateKey')}
+              isIconOnly
+              size="sm"
+              variant="light"
+              isDisabled={!gistAgeSecretKey}
+              onPress={handleCopyGistAgeSecretKey}
+            >
+              <BiCopy className="text-lg" />
+            </Button>
+          </Tooltip>
+        </div>
       </SettingItem>
       <SettingItem title={t('mihomo.proxyColumns.title')} divider>
         <Select
@@ -198,6 +356,36 @@ const MihomoConfig: React.FC = () => {
           </Select>
         </SettingItem>
       )}
+      <SettingItem
+        title={t('mihomo.coreStartupMode.title')}
+        actions={
+          <Tooltip content={t('mihomo.coreStartupMode.tooltip')}>
+            <Button isIconOnly size="sm" variant="light">
+              <IoIosHelpCircle className="text-lg" />
+            </Button>
+          </Tooltip>
+        }
+        divider
+      >
+        <Select
+          classNames={{ trigger: 'data-[hover=true]:bg-default-200' }}
+          className="w-37.5"
+          size="sm"
+          selectedKeys={new Set([coreStartupMode])}
+          disallowEmptySelection={true}
+          onSelectionChange={async (v) => {
+            try {
+              await patchAppConfig({ coreStartupMode: v.currentKey as 'log' | 'post-up' })
+              await restartCore()
+            } catch (e) {
+              toast.error(String(e))
+            }
+          }}
+        >
+          <SelectItem key="log">{t('mihomo.coreStartupMode.log')}</SelectItem>
+          <SelectItem key="post-up">{t('mihomo.coreStartupMode.postUp')}</SelectItem>
+        </Select>
+      </SettingItem>
       <SettingItem
         title={t('mihomo.workDir.title')}
         actions={
@@ -337,12 +525,98 @@ const MihomoConfig: React.FC = () => {
           )
         })}
       </div>
-      <SettingItem title={t('mihomo.disableDnsOnPauseSSID')}>
+      <SettingItem title={t('mihomo.disableDnsOnPauseSSID')} divider>
         <Switch
           size="sm"
           isSelected={disableDnsOnPauseSSID}
           onValueChange={(v) => {
             patchAppConfig({ disableDnsOnPauseSSID: v })
+          }}
+        />
+      </SettingItem>
+      <SettingItem title={t('mihomo.ssidProfile.title')}>
+        {hasSsidProfileChanges() && (
+          <Button
+            size="sm"
+            color="primary"
+            onPress={() => handleSaveSsidProfileMap(ssidProfileEntriesInput)}
+          >
+            {t('common.confirm')}
+          </Button>
+        )}
+      </SettingItem>
+      <div className="flex flex-col items-stretch mt-2">
+        {[...ssidProfileEntriesInput, { ssid: '', profileId: '' }].map((entry, index) => {
+          return (
+            <div key={index} className="flex mb-2 gap-2">
+              <Input
+                size="sm"
+                className="flex-1"
+                placeholder="SSID"
+                value={entry.ssid}
+                onValueChange={(v) => {
+                  if (index === ssidProfileEntriesInput.length) {
+                    setSsidProfileEntriesInput([
+                      ...ssidProfileEntriesInput,
+                      { ssid: v, profileId: '' }
+                    ])
+                  } else {
+                    setSsidProfileEntriesInput(
+                      ssidProfileEntriesInput.map((e, i) => (i === index ? { ...e, ssid: v } : e))
+                    )
+                  }
+                }}
+              />
+              <Select
+                classNames={{ trigger: 'data-[hover=true]:bg-default-200' }}
+                className="flex-1"
+                size="sm"
+                aria-label={t('mihomo.ssidProfile.selectProfile')}
+                selectedKeys={entry.profileId ? new Set([entry.profileId]) : new Set()}
+                placeholder={t('mihomo.ssidProfile.selectProfile')}
+                disallowEmptySelection
+                onSelectionChange={(v) => {
+                  const profileId = v.currentKey || ''
+                  if (index === ssidProfileEntriesInput.length) {
+                    setSsidProfileEntriesInput([
+                      ...ssidProfileEntriesInput,
+                      { ssid: '', profileId }
+                    ])
+                  } else {
+                    setSsidProfileEntriesInput(
+                      ssidProfileEntriesInput.map((e, i) => (i === index ? { ...e, profileId } : e))
+                    )
+                  }
+                }}
+              >
+                {profileItems.map((item) => (
+                  <SelectItem key={item.id}>{item.name}</SelectItem>
+                ))}
+              </Select>
+              {index < ssidProfileEntriesInput.length && (
+                <Button
+                  size="sm"
+                  variant="flat"
+                  color="warning"
+                  onPress={() =>
+                    setSsidProfileEntriesInput(
+                      ssidProfileEntriesInput.filter((_, i) => i !== index)
+                    )
+                  }
+                >
+                  <MdDeleteForever className="text-lg" />
+                </Button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <SettingItem title={t('mihomo.ssidProfile.restore')}>
+        <Switch
+          size="sm"
+          isSelected={ssidProfileRestore}
+          onValueChange={(v) => {
+            patchAppConfig({ ssidProfileRestore: v })
           }}
         />
       </SettingItem>

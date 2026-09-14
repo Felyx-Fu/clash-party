@@ -1,14 +1,32 @@
 import { tmpdir } from 'os'
 import { mkdir, readFile, rm, writeFile } from 'fs/promises'
-import { exec } from 'child_process'
+import { exec, execFile } from 'child_process'
 import { existsSync } from 'fs'
 import { promisify } from 'util'
 import path from 'path'
+import { app } from 'electron'
 import { exePath, homeDir } from '../utils/dirs'
 import { managerLogger } from '../utils/logger'
 import { checkAdminPrivileges } from '../core/admin'
 
 const appName = 'mihomo-party'
+// 1.x 通过 AppleScript 往 System Events 写登录项，这些旧条目不受 Service Management 管理，
+// 升级后必须单独清理，否则会与新登录项同时生效导致开机启动两次。
+const darwinLegacyLoginItemNames = ['Clash Party', 'Mihomo Party']
+
+// 旧登录项清理属于尽力而为：条目不存在、或系统未授予自动化权限时都直接忽略。
+async function removeDarwinLegacyLoginItems(): Promise<void> {
+  const names = [
+    ...new Set([path.basename(exePath().split('.app')[0]), ...darwinLegacyLoginItemNames])
+  ]
+  const condition = names.map((name) => `name is ${JSON.stringify(name)}`).join(' or ')
+  const script = `tell application "System Events" to delete (every login item where ${condition})`
+  try {
+    await promisify(execFile)('/usr/bin/osascript', ['-e', script])
+  } catch (error) {
+    await managerLogger.info('No legacy macOS login item removed', error)
+  }
+}
 
 function getTaskXml(asAdmin: boolean): string {
   const runLevel = asAdmin ? 'HighestAvailable' : 'LeastPrivilege'
@@ -57,6 +75,7 @@ function getTaskXml(asAdmin: boolean): string {
 export async function checkAutoRun(): Promise<boolean> {
   if (process.platform === 'win32') {
     const execPromise = promisify(exec)
+    const execFilePromise = promisify(execFile)
     // 先检查任务计划程序
     try {
       const { stdout } = await execPromise(
@@ -72,7 +91,7 @@ export async function checkAutoRun(): Promise<boolean> {
     // 检查注册表备用方案
     try {
       const regPath = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
-      const { stdout } = await execPromise(`reg query "${regPath}" /v "${appName}"`)
+      const { stdout } = await execFilePromise('reg', ['query', regPath, '/v', appName])
       return stdout.includes(appName)
     } catch {
       return false
@@ -80,11 +99,7 @@ export async function checkAutoRun(): Promise<boolean> {
   }
 
   if (process.platform === 'darwin') {
-    const execPromise = promisify(exec)
-    const { stdout } = await execPromise(
-      `osascript -e 'tell application "System Events" to get the name of every login item'`
-    )
-    return stdout.includes(exePath().split('.app')[0].replace('/Applications/', ''))
+    return app.getLoginItemSettings().openAtLogin
   }
 
   if (process.platform === 'linux') {
@@ -96,11 +111,19 @@ export async function checkAutoRun(): Promise<boolean> {
 export async function enableAutoRun(): Promise<void> {
   if (process.platform === 'win32') {
     const execPromise = promisify(exec)
+    const execFilePromise = promisify(execFile)
+    const regPath = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
     const taskFilePath = path.join(tmpdir(), `${appName}.xml`)
     const isAdmin = await checkAdminPrivileges()
     await writeFile(taskFilePath, Buffer.from(`\ufeff${getTaskXml(isAdmin)}`, 'utf-16le'))
 
     let taskCreated = false
+
+    try {
+      await execFilePromise('reg', ['delete', regPath, '/v', appName, '/f'])
+    } catch {
+      // ignore
+    }
 
     if (isAdmin) {
       try {
@@ -118,13 +141,23 @@ export async function enableAutoRun(): Promise<void> {
         )
         // 验证任务是否创建成功
         await new Promise((resolve) => setTimeout(resolve, 1000))
-        const created = await checkAutoRun()
+      } catch {
+        await managerLogger.info('Scheduled task creation failed, trying registry fallback')
+      }
+    }
+
+    if (!taskCreated) {
+      try {
+        const { stdout } = await execPromise(
+          `chcp 437 && %SystemRoot%\\System32\\schtasks.exe /query /tn "${appName}"`
+        )
+        const created = stdout.includes(appName)
         taskCreated = created
         if (!created) {
           await managerLogger.warn('Scheduled task creation may have failed or been rejected')
         }
       } catch {
-        await managerLogger.info('Scheduled task creation failed, trying registry fallback')
+        // ignore
       }
     }
 
@@ -132,9 +165,18 @@ export async function enableAutoRun(): Promise<void> {
     if (!taskCreated) {
       await managerLogger.info('Using registry fallback for auto-run')
       try {
-        const regPath = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
         const regValue = `"${exePath()}"`
-        await execPromise(`reg add "${regPath}" /v "${appName}" /t REG_SZ /d ${regValue} /f`)
+        await execFilePromise('reg', [
+          'add',
+          regPath,
+          '/v',
+          appName,
+          '/t',
+          'REG_SZ',
+          '/d',
+          regValue,
+          '/f'
+        ])
         await managerLogger.info('Registry auto-run entry created successfully')
       } catch (regError) {
         await managerLogger.error('Failed to create registry auto-run entry:', regError)
@@ -142,10 +184,12 @@ export async function enableAutoRun(): Promise<void> {
     }
   }
   if (process.platform === 'darwin') {
-    const execPromise = promisify(exec)
-    await execPromise(
-      `osascript -e 'tell application "System Events" to make login item at end with properties {path:"${exePath().split('.app')[0]}.app", hidden:false}'`
-    )
+    await removeDarwinLegacyLoginItems()
+    app.setLoginItemSettings({ openAtLogin: true })
+    const { openAtLogin, status } = app.getLoginItemSettings()
+    if (!openAtLogin) {
+      throw new Error(`Failed to register login item${status ? ` (${status})` : ''}`)
+    }
   }
   if (process.platform === 'linux') {
     let desktop = `
@@ -175,6 +219,7 @@ Categories=Utility;
 export async function disableAutoRun(): Promise<void> {
   if (process.platform === 'win32') {
     const execPromise = promisify(exec)
+    const execFilePromise = promisify(execFile)
     const isAdmin = await checkAdminPrivileges()
 
     // 删除任务计划程序中的任务
@@ -193,16 +238,14 @@ export async function disableAutoRun(): Promise<void> {
     // 同时删除注册表备用方案
     try {
       const regPath = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
-      await execPromise(`reg delete "${regPath}" /v "${appName}" /f`)
+      await execFilePromise('reg', ['delete', regPath, '/v', appName, '/f'])
     } catch {
       // 注册表项可能不存在，忽略错误
     }
   }
   if (process.platform === 'darwin') {
-    const execPromise = promisify(exec)
-    await execPromise(
-      `osascript -e 'tell application "System Events" to delete login item "${exePath().split('.app')[0].replace('/Applications/', '')}"'`
-    )
+    app.setLoginItemSettings({ openAtLogin: false })
+    await removeDarwinLegacyLoginItems()
   }
   if (process.platform === 'linux') {
     const desktopFilePath = path.join(homeDir, '.config', 'autostart', `${appName}.desktop`)

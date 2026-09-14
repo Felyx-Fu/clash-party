@@ -1,6 +1,6 @@
 import { Button, Card, CardBody, CardFooter, Tooltip } from '@heroui/react'
 import { useControledMihomoConfig } from '@renderer/hooks/use-controled-mihomo-config'
-import BorderSwitch from '@renderer/components/base/border-swtich'
+import BorderSwitch from '@renderer/components/base/border-switch'
 import { TbDeviceIpadHorizontalBolt } from 'react-icons/tb'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { updateTrayIconImmediate } from '@renderer/utils/ipc'
@@ -90,8 +90,11 @@ const TunSwitcher: React.FC<Props> = (props) => {
       }
 
       await patchControledMihomoConfig({ tun: { enable }, dns: { enable: true } })
-      if (enable && appConfig?.silentStart) {
-        await window.electron.ipcRenderer.invoke('enableAutoRun')
+      if (enable) {
+        const autoRunEnabled = await window.electron.ipcRenderer.invoke('checkAutoRun')
+        if (autoRunEnabled) {
+          await window.electron.ipcRenderer.invoke('enableAutoRun')
+        }
       }
     } else {
       await patchControledMihomoConfig({ tun: { enable } })

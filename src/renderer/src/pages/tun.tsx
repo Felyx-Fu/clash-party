@@ -11,10 +11,12 @@ import {
   setupFirewall
 } from '@renderer/utils/ipc'
 import { platform } from '@renderer/utils/init'
+import { ipCIDRValidator } from '@renderer/utils/validate'
 import React, { Key, useState } from 'react'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import { MdDeleteForever } from 'react-icons/md'
 import { useTranslation } from 'react-i18next'
+import { DEFAULT_MIHOMO_TUN_CONFIG, getDefaultMihomoTunDevice } from '../../../shared/appConfig'
 
 const Tun: React.FC = () => {
   const { t } = useTranslation()
@@ -24,15 +26,19 @@ const Tun: React.FC = () => {
   const { tun } = controledMihomoConfig || {}
   const [loading, setLoading] = useState(false)
   const {
-    device = platform === 'darwin' ? 'utun1500' : 'Mihomo',
-    stack = 'mixed',
-    'auto-route': autoRoute = true,
-    'auto-redirect': autoRedirect = false,
-    'auto-detect-interface': autoDetectInterface = true,
-    'dns-hijack': dnsHijack = ['any:53'],
-    'route-exclude-address': routeExcludeAddress = [],
+    device = getDefaultMihomoTunDevice(platform),
+    stack = DEFAULT_MIHOMO_TUN_CONFIG.stack,
+    'auto-route': autoRoute = DEFAULT_MIHOMO_TUN_CONFIG['auto-route'],
+    'auto-redirect': autoRedirect = DEFAULT_MIHOMO_TUN_CONFIG['auto-redirect'],
+    'auto-detect-interface': autoDetectInterface = DEFAULT_MIHOMO_TUN_CONFIG[
+      'auto-detect-interface'
+    ],
+    'dns-hijack': dnsHijack = DEFAULT_MIHOMO_TUN_CONFIG['dns-hijack'],
+    'route-exclude-address': routeExcludeAddress = DEFAULT_MIHOMO_TUN_CONFIG[
+      'route-exclude-address'
+    ],
     'strict-route': strictRoute = false,
-    mtu = 1500
+    mtu = DEFAULT_MIHOMO_TUN_CONFIG.mtu
   } = tun || {}
   const [changed, setChanged] = useState(false)
   const [values, originSetValues] = useState({
@@ -44,11 +50,25 @@ const Tun: React.FC = () => {
     dnsHijack,
     strictRoute,
     routeExcludeAddress,
-    mtu
+    mtu: Math.min(Math.max(mtu || 1500, 1), 65535)
   })
   const setValues = (v: typeof values): void => {
     originSetValues(v)
     setChanged(true)
+  }
+  const normalizedRouteExcludeAddress = values.routeExcludeAddress
+    .map((address) => address.trim())
+    .filter(Boolean)
+  const hasInvalidExcludeAddress = normalizedRouteExcludeAddress.some(
+    (address) => !ipCIDRValidator(address)
+  )
+  const excludeAddressInputs = hasInvalidExcludeAddress
+    ? values.routeExcludeAddress
+    : [...values.routeExcludeAddress, '']
+  const getExcludeAddressError = (address: string): string | undefined => {
+    const trimmedAddress = address.trim()
+    if (trimmedAddress === '' || ipCIDRValidator(trimmedAddress)) return undefined
+    return t('tun.excludeAddress.invalid')
   }
 
   const handleExcludeAddressChange = (value: string, index: number): void => {
@@ -68,11 +88,19 @@ const Tun: React.FC = () => {
   }
 
   const onSave = async (patch: Partial<IMihomoConfig>): Promise<void> => {
+    const tunPatch = { ...patch.tun }
+    if (hasInvalidExcludeAddress) {
+      // 存在非法条目时不覆盖已保存的排除地址，避免静默丢弃用户数据；其它 TUN 设置照常保存
+      delete tunPatch['route-exclude-address']
+    } else {
+      // 全部合法：写入去空格、去空项后的列表
+      tunPatch['route-exclude-address'] = normalizedRouteExcludeAddress
+    }
     try {
-      await patchControledMihomoConfig(patch)
+      await patchControledMihomoConfig({ ...patch, tun: tunPatch })
       await mihomoHotReloadConfig()
     } catch (e) {
-      showErrorSync(e, t('common.error.configSaveFailed'))
+      showErrorSync(e, t('common.error.updateCoreConfigFailed'))
     } finally {
       setChanged(false)
     }
@@ -181,7 +209,7 @@ const Tun: React.FC = () => {
               size="sm"
               className="w-25"
               value={values.device}
-              placeholder={platform === 'darwin' ? 'utun1500' : 'Mihomo'}
+              placeholder={getDefaultMihomoTunDevice(platform)}
               onValueChange={(v) => {
                 setValues({ ...values, device: v })
               }}
@@ -232,9 +260,12 @@ const Tun: React.FC = () => {
               type="number"
               className="w-25"
               value={values.mtu.toString()}
+              min={1}
               onValueChange={(v) => {
-                const num = parseInt(v)
-                setValues({ ...values, mtu: isNaN(num) ? 1500 : num })
+                setValues({
+                  ...values,
+                  mtu: Math.min(Math.max(parseInt(v) || 1500, 1), 65535)
+                })
               }}
             />
           </SettingItem>
@@ -251,13 +282,15 @@ const Tun: React.FC = () => {
           </SettingItem>
           <div className="flex flex-col items-stretch">
             <h3 className="mb-2">{t('tun.excludeAddress.title')}</h3>
-            {[...values.routeExcludeAddress, ''].map((address, index) => (
+            {excludeAddressInputs.map((address, index) => (
               <div key={index} className="mb-2 flex">
                 <Input
                   fullWidth
                   size="sm"
                   placeholder={t('tun.excludeAddress.placeholder')}
                   value={address}
+                  isInvalid={Boolean(getExcludeAddressError(address))}
+                  errorMessage={getExcludeAddressError(address)}
                   onValueChange={(v) => handleExcludeAddressChange(v, index)}
                 />
                 {index < values.routeExcludeAddress.length && (
@@ -273,6 +306,9 @@ const Tun: React.FC = () => {
                 )}
               </div>
             ))}
+            {hasInvalidExcludeAddress && (
+              <div className="px-1 text-xs text-danger">{t('tun.excludeAddress.notSaved')}</div>
+            )}
           </div>
         </SettingCard>
       </BasePage>

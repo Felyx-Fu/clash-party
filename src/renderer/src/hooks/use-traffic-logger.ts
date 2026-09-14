@@ -1,101 +1,90 @@
 import { useEffect, useRef } from 'react'
-import { db, type DataUsageLog } from '@renderer/utils/db'
+import { legacyTrafficUsageDatabase } from '@renderer/utils/legacy-traffic-db'
+import { importTrafficUsage } from '@renderer/utils/ipc'
+import {
+  TRAFFIC_USAGE_FLUSH_THRESHOLD,
+  TrafficUsageAccumulator
+} from '../../../shared/trafficUsage'
 
-export function useTrafficLogger(): void {
-  const connectionLastDataRef = useRef(new Map<string, { upload: number; download: number }>())
-  const logBufferRef = useRef<DataUsageLog[]>([])
-  const flushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastTotalsRef = useRef({ upload: 0, download: 0 })
+const FLUSH_DELAY_MS = 5000
+
+export function useTrafficLogger(enabled = true): void {
+  const accumulatorRef = useRef(new TrafficUsageAccumulator())
 
   useEffect(() => {
-    const flushLogs = async (): Promise<void> => {
-      if (logBufferRef.current.length === 0) return
-      const toFlush = [...logBufferRef.current]
-      logBufferRef.current = []
-      try {
-        await db.addLogs(toFlush)
-        await db.cleanup(Date.now() - 30 * 24 * 60 * 60 * 1000)
-      } catch (e) {
-        console.error('[TrafficLogger] flush failed', e)
-      }
+    if (__LEGACY_BUILD__) return
+    void legacyTrafficUsageDatabase
+      .migrateToBackend(importTrafficUsage)
+      .catch((error) => console.error('[TrafficLogger] migration failed', error))
+  }, [])
+
+  useEffect(() => {
+    const accumulator = accumulatorRef.current
+    const active = __LEGACY_BUILD__ && enabled
+    accumulator.setEnabled(active)
+    if (!active) return
+
+    let disposed = false
+    let flushTimer: ReturnType<typeof setTimeout> | null = null
+    let inFlight: Promise<void> | null = null
+
+    const clearFlushTimer = (): void => {
+      if (!flushTimer) return
+      clearTimeout(flushTimer)
+      flushTimer = null
     }
 
-    const scheduleFlush = (): void => {
-      if (flushTimeoutRef.current) return
-      flushTimeoutRef.current = setTimeout(async () => {
-        await flushLogs()
-        flushTimeoutRef.current = null
-      }, 5000)
+    const scheduleFlush = (delay = FLUSH_DELAY_MS): void => {
+      if (disposed || flushTimer) return
+      flushTimer = setTimeout(() => {
+        flushTimer = null
+        void flush()
+      }, delay)
     }
 
-    const handler = (_e: unknown, ...args: unknown[]): void => {
-      const info = args[0] as IMihomoConnectionsInfo
-      if (!info.connections?.length) return
+    const flush = async (): Promise<void> => {
+      if (disposed || inFlight) return inFlight ?? Promise.resolve()
+      const records = accumulator.takePending()
+      if (records.length === 0) return
 
-      const uploadTotal = info.uploadTotal || 0
-      const downloadTotal = info.downloadTotal || 0
-
-      // Detect service restart (totals decreased)
-      if (
-        uploadTotal < lastTotalsRef.current.upload ||
-        downloadTotal < lastTotalsRef.current.download
-      ) {
-        connectionLastDataRef.current.clear()
-        logBufferRef.current = []
-        db.clearAll().catch(console.error)
-      }
-      lastTotalsRef.current = { upload: uploadTotal, download: downloadTotal }
-
-      const now = Date.now()
-      let hasDeltas = false
-
-      for (const conn of info.connections) {
-        const currentUpload = conn.upload || 0
-        const currentDownload = conn.download || 0
-        const last = connectionLastDataRef.current.get(conn.id)
-
-        let uploadDelta: number
-        let downloadDelta: number
-
-        if (last) {
-          uploadDelta = Math.max(0, currentUpload - last.upload)
-          downloadDelta = Math.max(0, currentDownload - last.download)
-        } else {
-          uploadDelta = currentUpload
-          downloadDelta = currentDownload
-        }
-
-        connectionLastDataRef.current.set(conn.id, {
-          upload: currentUpload,
-          download: currentDownload
+      let failed = false
+      inFlight = legacyTrafficUsageDatabase
+        .upsert(records)
+        .catch((error) => {
+          failed = true
+          if (!disposed) accumulator.merge(records)
+          console.error('[TrafficLogger] flush failed', error)
         })
-
-        if (uploadDelta === 0 && downloadDelta === 0) continue
-
-        hasDeltas = true
-        logBufferRef.current.push({
-          timestamp: now,
-          sourceIP: conn.metadata.sourceIP || 'Inner',
-          host: conn.metadata.host || conn.metadata.destinationIP || 'Unknown',
-          process: conn.metadata.process || 'Unknown',
-          outbound: conn.chains?.[0] || 'DIRECT',
-          upload: uploadDelta,
-          download: downloadDelta
+        .finally(() => {
+          inFlight = null
+          if (!disposed && accumulator.pendingSize > 0) {
+            scheduleFlush(
+              !failed && accumulator.pendingSize >= TRAFFIC_USAGE_FLUSH_THRESHOLD
+                ? 0
+                : FLUSH_DELAY_MS
+            )
+          }
         })
-      }
-
-      if (hasDeltas) scheduleFlush()
+      return inFlight
     }
 
-    window.electron.ipcRenderer.on('mihomoConnections', handler)
+    const handler = (_event: unknown, ...args: unknown[]): void => {
+      const info = args[0] as IMihomoConnectionsInfo | undefined
+      if (!info) return
+      if (accumulator.addSnapshot(info)) void flush()
+      else if (accumulator.pendingSize > 0) scheduleFlush()
+    }
+
+    void legacyTrafficUsageDatabase
+      .migrateLegacyLogs()
+      .catch((error) => console.error('[TrafficLogger] migration failed', error))
+    const unsubscribe = window.electron.ipcRenderer.on('mihomoConnections', handler)
 
     return (): void => {
-      window.electron.ipcRenderer.removeListener('mihomoConnections', handler)
-      if (flushTimeoutRef.current) {
-        clearTimeout(flushTimeoutRef.current)
-        flushTimeoutRef.current = null
-      }
-      flushLogs()
+      disposed = true
+      clearFlushTimer()
+      unsubscribe()
+      accumulator.setEnabled(false)
     }
-  }, [])
+  }, [enabled])
 }

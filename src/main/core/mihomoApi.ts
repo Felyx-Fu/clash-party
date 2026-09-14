@@ -1,14 +1,18 @@
+import { createConnection } from 'net'
 import axios, { AxiosInstance } from 'axios'
 import WebSocket from 'ws'
-import { getAppConfig, getControledMihomoConfig } from '../config'
+import { app } from 'electron'
+import { getAppConfig, getControledMihomoConfig, manageSmartOverride } from '../config'
 import { mainWindow } from '../window'
 import { tray } from '../resolve/tray'
 import { calcTraffic } from '../utils/calc'
 import { floatingWindow } from '../resolve/floatingWindow'
+import { recordTrafficUsage } from '../traffic/recorder'
 import { createLogger } from '../utils/logger'
 import { mihomoWorkConfigPath } from '../utils/dirs'
 import { generateProfile, getRuntimeConfig } from './factory'
-import { getMihomoIpcPath } from './manager'
+import { syncControlDnsAfterApply } from './dnsOverrideGuard'
+import { getMihomoIpcPath, hasCoreProcess, restartCore } from './manager'
 
 const mihomoApiLogger = createLogger('MihomoApi')
 
@@ -143,6 +147,25 @@ function closeErroredStreamSocket(
   }
 }
 
+function createMihomoWebSocket(endpoint: string): {
+  ws: WebSocket
+  ipcPath: string
+  wsUrl: string
+} {
+  const ipcPath = getMihomoIpcPath()
+  const wsUrl = `ws://localhost${endpoint}`
+
+  // Keep the named pipe path out of ws+unix URLs. URL parsing percent-encodes
+  // non-ASCII Windows usernames, which changes the pipe name before ws connects.
+  const createIpcConnection = (() => createConnection({ path: ipcPath })) as typeof createConnection
+
+  return {
+    ws: new WebSocket(wsUrl, { createConnection: createIpcConnection }),
+    ipcPath,
+    wsUrl
+  }
+}
+
 export const getAxios = async (force: boolean = false): Promise<AxiosInstance> => {
   const dynamicIpcPath = getMihomoIpcPath()
 
@@ -185,8 +208,27 @@ export async function mihomoVersion(): Promise<IMihomoVersion> {
 }
 
 export const patchMihomoConfig = async (patch: Partial<IMihomoConfig>): Promise<void> => {
-  const instance = await getAxios()
-  return await instance.patch('/configs', patch)
+  const patchConfig = async (): Promise<void> => {
+    const instance = await getAxios()
+    await instance.patch('/configs', patch)
+  }
+
+  // Configuration patches can also be the first recovery action after startup
+  // failed. Do not start the core during pre-ready migrations.
+  if (!hasCoreProcess() && app.isReady()) {
+    mihomoApiLogger.warn('Core is not running, restarting core before config patch')
+    await restartCore()
+  }
+
+  try {
+    await patchConfig()
+  } catch (error) {
+    if (hasCoreProcess() || !app.isReady()) throw error
+
+    mihomoApiLogger.warn('Core exited before config patch completed, restarting core', error)
+    await restartCore()
+    await patchConfig()
+  }
 }
 
 export const mihomoCloseConnection = async (id: string): Promise<void> => {
@@ -218,31 +260,95 @@ export const mihomoProxies = async (): Promise<IMihomoProxies> => {
   return proxies
 }
 
-export const mihomoGroups = async (): Promise<IMihomoMixedGroup[]> => {
+function isMihomoGroup(proxy: IMihomoProxy | IMihomoGroup | undefined): proxy is IMihomoGroup {
+  return Boolean(proxy && 'all' in proxy)
+}
+
+const PROVIDER_DETAIL_FETCH_THRESHOLD = 8
+
+async function mihomoProxyProvider(name: string): Promise<IMihomoProxyProvider> {
+  const instance = await getAxios()
+  return await instance.get(`/providers/proxies/${encodeURIComponent(name)}`)
+}
+
+async function resolveProviderProxies(
+  names: Set<string>,
+  providerNames: Set<string>,
+  fallbackToAllProviders: boolean
+): Promise<Record<string, IMihomoProxy>> {
+  if (names.size === 0) return {}
+
+  const providers =
+    fallbackToAllProviders || providerNames.size > PROVIDER_DETAIL_FETCH_THRESHOLD
+      ? Object.values((await mihomoProxyProviders()).providers)
+      : (
+          await Promise.allSettled([...providerNames].map((name) => mihomoProxyProvider(name)))
+        ).flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []))
+
+  const providerProxies: Record<string, IMihomoProxy> = {}
+  providers.forEach((provider) => {
+    provider.proxies?.forEach((proxy) => {
+      if (names.has(proxy.name)) {
+        providerProxies[proxy.name] = proxy
+      }
+    })
+  })
+  return providerProxies
+}
+
+export const mihomoGroups = async (includeHidden = false): Promise<IMihomoMixedGroup[]> => {
   const { mode = 'rule' } = await getControledMihomoConfig()
   if (mode === 'direct') return []
-  const proxies = await mihomoProxies()
-  const runtime = await getRuntimeConfig()
-  const groups: IMihomoMixedGroup[] = []
-  runtime?.['proxy-groups']?.forEach((group: { name: string; url?: string }) => {
-    const { name, url } = group
-    if (proxies.proxies[name] && 'all' in proxies.proxies[name] && !proxies.proxies[name].hidden) {
-      const newGroup = proxies.proxies[name]
-      newGroup.testUrl = url
-      const newAll = (newGroup.all || []).map((name) => proxies.proxies[name])
-      groups.push({ ...newGroup, all: newAll })
+  const [proxies, runtime] = await Promise.all([mihomoProxies(), getRuntimeConfig()])
+  const rawGroups: { group: IMihomoGroup; providers: string[] }[] = []
+
+  runtime?.['proxy-groups']?.forEach((group: { name: string; url?: string; use?: string[] }) => {
+    const proxy = proxies.proxies[group.name]
+    if (isMihomoGroup(proxy) && (includeHidden || !proxy.hidden)) {
+      rawGroups.push({ group: { ...proxy, testUrl: group.url }, providers: group.use || [] })
     }
   })
-  if (!groups.find((group) => group.name === 'GLOBAL')) {
-    const newGlobal = proxies.proxies['GLOBAL'] as IMihomoGroup
-    if (!newGlobal.hidden) {
-      const newAll = (newGlobal.all || []).map((name) => proxies.proxies[name])
-      groups.push({ ...newGlobal, all: newAll })
+
+  if (!rawGroups.find(({ group }) => group.name === 'GLOBAL')) {
+    const global = proxies.proxies['GLOBAL']
+    if (isMihomoGroup(global) && (includeHidden || !global.hidden)) {
+      rawGroups.push({ group: global, providers: [] })
     }
   }
+
+  const missingProxyNames = new Set<string>()
+  const providerNames = new Set<string>()
+  let fallbackToAllProviders = false
+  rawGroups.forEach(({ group, providers }) => {
+    const proxyNames = group.all || []
+    proxyNames.forEach((name) => {
+      if (!proxies.proxies[name]) {
+        missingProxyNames.add(name)
+        if (providers.length > 0) {
+          providers.forEach((provider) => providerNames.add(provider))
+        } else {
+          fallbackToAllProviders = true
+        }
+      }
+    })
+  })
+
+  const providerProxies = await resolveProviderProxies(
+    missingProxyNames,
+    providerNames,
+    fallbackToAllProviders
+  )
+  const groups: IMihomoMixedGroup[] = []
+  rawGroups.forEach(({ group }) => {
+    const newAll = (group.all || [])
+      .map((name) => proxies.proxies[name] || providerProxies[name])
+      .filter((proxy): proxy is IMihomoProxy | IMihomoGroup => Boolean(proxy))
+    groups.push({ ...group, all: newAll })
+  })
+
   if (mode === 'global') {
     const global = groups.findIndex((group) => group.name === 'GLOBAL')
-    groups.unshift(groups.splice(global, 1)[0])
+    if (global > 0) groups.unshift(groups.splice(global, 1)[0])
   }
   return groups
 }
@@ -282,11 +388,18 @@ export const mihomoUpgradeGeo = async (): Promise<void> => {
   return await instance.post('/configs/geo')
 }
 
-export const mihomoProxyDelay = async (proxy: string, url?: string): Promise<IMihomoDelay> => {
+export const mihomoProxyDelay = async (
+  proxy: string,
+  url?: string,
+  provider?: string
+): Promise<IMihomoDelay> => {
   const appConfig = await getAppConfig()
   const { delayTestUrl, delayTestTimeout } = appConfig
   const instance = await getAxios()
-  return await instance.get(`/proxies/${encodeURIComponent(proxy)}/delay`, {
+  const path = provider
+    ? `/providers/proxies/${encodeURIComponent(provider)}/${encodeURIComponent(proxy)}/healthcheck`
+    : `/proxies/${encodeURIComponent(proxy)}/delay`
+  return await instance.get(path, {
     params: {
       url: delayTestUrl || url || 'https://www.gstatic.com/generate_204',
       timeout: delayTestTimeout || 5000
@@ -318,13 +431,39 @@ export const mihomoUpgradeUI = async (): Promise<void> => {
 
 export const mihomoHotReloadConfig = async (): Promise<void> => {
   mihomoApiLogger.info('mihomoHotReloadConfig called')
-  const current = await generateProfile()
+  if (!hasCoreProcess()) {
+    mihomoApiLogger.warn('Core is not running, restarting core instead of hot reload')
+    await restartCore()
+    return
+  }
+  // Smart 覆写脚本由应用配置生成，必须先同步再生成配置，
+  // 否则界面上改动的 Smart 选项会沿用旧脚本，要等到下次重启内核才生效
+  await manageSmartOverride()
+  const { profileId: current, dnsGuard } = await generateProfile()
   const { diffWorkDir = false } = await getAppConfig()
   const configPath = diffWorkDir ? mihomoWorkConfigPath(current) : mihomoWorkConfigPath('work')
   mihomoApiLogger.info(`hot reload config path: ${configPath}`)
   const instance = await getAxios()
-  await instance.put('/configs?force=true', { path: configPath })
+  try {
+    await instance.put('/configs?force=true', { path: configPath })
+  } catch (error) {
+    if (hasCoreProcess()) throw error
+    mihomoApiLogger.warn('Core exited before hot reload completed, restarting core', error)
+    await restartCore()
+    return
+  }
   mihomoApiLogger.info('hot reload config completed')
+  try {
+    await syncControlDnsAfterApply(dnsGuard)
+  } catch (error) {
+    mihomoApiLogger.warn('Failed to sync DNS override state after hot reload', error)
+  }
+  try {
+    const { scheduleRuntimeConfigUpload } = await import('../resolve/gistApi')
+    scheduleRuntimeConfigUpload()
+  } catch (error) {
+    mihomoApiLogger.warn('Failed to schedule runtime config Gist sync', error)
+  }
 }
 
 // Smart 内核 API
@@ -357,20 +496,20 @@ const mihomoTraffic = async (): Promise<void> => {
   const generation = beginStreamConnection(trafficStream)
   if (generation === null) return
 
-  const dynamicIpcPath = getMihomoIpcPath()
-  const wsUrl = `ws+unix:${dynamicIpcPath}:/traffic`
+  const { ws, ipcPath, wsUrl } = createMihomoWebSocket('/traffic')
 
-  mihomoApiLogger.info(`Creating traffic WebSocket with URL: ${wsUrl}`)
-  const ws = new WebSocket(wsUrl)
+  mihomoApiLogger.info(`Creating traffic WebSocket with URL: ${wsUrl}, IPC path: ${ipcPath}`)
   trafficStream.ws = ws
 
-  ws.onmessage = async (e): Promise<void> => {
+  ws.onmessage = (e): void => {
     if (!isCurrentStream(trafficStream, generation)) return
 
     const data = e.data as string
-    const json = JSON.parse(data) as IMihomoTrafficInfo
     trafficStream.retry = MAX_RETRY
     try {
+      // JSON.parse 必须放在 try 内：内核发来非 JSON 帧时，旧实现会在 async 回调里
+      // 抛出并变成未捕获的 Promise rejection（其余三条流都已在 try 内解析）。
+      const json = JSON.parse(data) as IMihomoTrafficInfo
       mainWindow?.webContents.send('mihomoTraffic', json)
       if (process.platform !== 'linux') {
         tray?.setToolTip(
@@ -411,9 +550,7 @@ const mihomoMemory = async (): Promise<void> => {
   const generation = beginStreamConnection(memoryStream)
   if (generation === null) return
 
-  const dynamicIpcPath = getMihomoIpcPath()
-  const wsUrl = `ws+unix:${dynamicIpcPath}:/memory`
-  const ws = new WebSocket(wsUrl)
+  const { ws } = createMihomoWebSocket('/memory')
   memoryStream.ws = ws
 
   ws.onmessage = (e): void => {
@@ -453,10 +590,8 @@ const mihomoLogs = async (): Promise<void> => {
   if (generation === null) return
 
   const { 'log-level': logLevel = 'info' } = await getControledMihomoConfig()
-  const dynamicIpcPath = getMihomoIpcPath()
-  const wsUrl = `ws+unix:${dynamicIpcPath}:/logs?level=${logLevel}`
 
-  const ws = new WebSocket(wsUrl)
+  const { ws } = createMihomoWebSocket(`/logs?level=${logLevel}`)
   logsStream.ws = ws
 
   ws.onmessage = (e): void => {
@@ -495,9 +630,7 @@ const mihomoConnections = async (): Promise<void> => {
   const generation = beginStreamConnection(connectionsStream)
   if (generation === null) return
 
-  const dynamicIpcPath = getMihomoIpcPath()
-  const wsUrl = `ws+unix:${dynamicIpcPath}:/connections`
-  const ws = new WebSocket(wsUrl)
+  const { ws } = createMihomoWebSocket('/connections')
   connectionsStream.ws = ws
 
   ws.onmessage = (e): void => {
@@ -506,7 +639,11 @@ const mihomoConnections = async (): Promise<void> => {
     const data = e.data as string
     connectionsStream.retry = MAX_RETRY
     try {
-      mainWindow?.webContents.send('mihomoConnections', JSON.parse(data) as IMihomoConnectionsInfo)
+      const info = JSON.parse(data) as IMihomoConnectionsInfo
+      recordTrafficUsage(info)
+      if (__LEGACY_BUILD__ || mainWindow?.isVisible()) {
+        mainWindow?.webContents.send('mihomoConnections', info)
+      }
     } catch {
       // ignore
     }
@@ -525,7 +662,9 @@ const mihomoConnections = async (): Promise<void> => {
 
 export async function SysProxyStatus(): Promise<boolean> {
   const appConfig = await getAppConfig()
-  return appConfig.sysProxy.enable
+  // 配置缺失/损坏时 sysProxy 可能为 undefined，直接取 .enable 会抛错并连带
+  // 把托盘图标状态刷新整条链路打断（TunStatus 已经是可选链写法）。
+  return appConfig?.sysProxy?.enable === true
 }
 
 export const TunStatus = async (): Promise<boolean> => {

@@ -9,11 +9,12 @@ import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import 'dayjs/locale/zh-cn'
 import dayjs from '@renderer/utils/dayjs'
-import React, { useState } from 'react'
+import React, { lazy, Suspense, useState } from 'react'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import { TiFolder } from 'react-icons/ti'
 import { useTranslation } from 'react-i18next'
-import ConfigViewer from './config-viewer'
+
+const ConfigViewer = lazy(() => import('./config-viewer'))
 
 dayjs.extend(relativeTime)
 dayjs.locale('zh-cn')
@@ -89,7 +90,11 @@ const ProfileCard: React.FC<Props> = (props) => {
       }}
       className={`${profileCardStatus} profile-card`}
     >
-      {showRuntimeConfig && <ConfigViewer onClose={() => setShowRuntimeConfig(false)} />}
+      {showRuntimeConfig && (
+        <Suspense fallback={null}>
+          <ConfigViewer onClose={() => setShowRuntimeConfig(false)} />
+        </Suspense>
+      )}
       {profileCardStatus === 'col-span-2' ? (
         <Card
           fullWidth
@@ -103,11 +108,11 @@ const ProfileCard: React.FC<Props> = (props) => {
               ref={setNodeRef}
               {...attributes}
               {...listeners}
-              className="flex justify-between h-[32px]"
+              className="flex justify-between h-8"
             >
               <h3
                 title={info?.name}
-                className={`text-ellipsis whitespace-nowrap overflow-hidden text-md font-bold leading-[32px] ${match ? 'text-primary-foreground' : 'text-foreground'}`}
+                className={`text-ellipsis whitespace-nowrap overflow-hidden text-md font-bold leading-8 ${match ? 'text-primary-foreground' : 'text-foreground'}`}
               >
                 {info?.name}
               </h3>
@@ -127,7 +132,7 @@ const ProfileCard: React.FC<Props> = (props) => {
                   />
                 </Button>
                 {info.type === 'remote' && (
-                  <Tooltip placement="left" content={dayjs(info.updated).fromNow()}>
+                  <Tooltip placement="top" delay={1000} content={dayjs(info.updated).fromNow()}>
                     <Button
                       isIconOnly
                       size="sm"
@@ -157,7 +162,7 @@ const ProfileCard: React.FC<Props> = (props) => {
                   <Button
                     size="sm"
                     variant="light"
-                    className={`h-[20px] p-1 m-0 ${match ? 'text-primary-foreground' : 'text-foreground'}`}
+                    className={`h-5 p-1 m-0 ${match ? 'text-primary-foreground' : 'text-foreground'}`}
                     onPress={async () => {
                       await patchAppConfig({ profileDisplayDate: 'update' })
                     }}
@@ -170,7 +175,7 @@ const ProfileCard: React.FC<Props> = (props) => {
                   <Button
                     size="sm"
                     variant="light"
-                    className={`h-[20px] p-1 m-0 ${match ? 'text-primary-foreground' : 'text-foreground'}`}
+                    className={`h-5 p-1 m-0 ${match ? 'text-primary-foreground' : 'text-foreground'}`}
                     onPress={async () => {
                       await patchAppConfig({ profileDisplayDate: 'expire' })
                     }}

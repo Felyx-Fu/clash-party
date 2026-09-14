@@ -1,6 +1,16 @@
 import React, { useEffect, useState } from 'react'
 import { toast } from '@renderer/components/base/toast'
-import { Button, Input, Select, SelectItem, Switch, Tab, Tabs, Tooltip } from '@heroui/react'
+import {
+  Button,
+  Divider,
+  Input,
+  Select,
+  SelectItem,
+  Switch,
+  Tab,
+  Tabs,
+  Tooltip
+} from '@heroui/react'
 import { BiCopy, BiSolidFileImport } from 'react-icons/bi'
 import useSWR from 'swr'
 import {
@@ -27,7 +37,7 @@ import { useAppConfig } from '@renderer/hooks/use-app-config'
 import debounce from '@renderer/utils/debounce'
 import { platform } from '@renderer/utils/init'
 import { useTheme } from 'next-themes'
-import { IoIosHelpCircle, IoMdCloudDownload } from 'react-icons/io'
+import { IoIosArrowDown, IoIosHelpCircle, IoMdCloudDownload } from 'react-icons/io'
 import { MdEditDocument } from 'react-icons/md'
 import { useTranslation } from 'react-i18next'
 import SettingItem from '../base/base-setting-item'
@@ -37,6 +47,15 @@ import CSSEditorModal from './css-editor-modal'
 import TrayIconCropModal from './tray-icon-crop-modal'
 
 const rasterTrayIconPattern = /\.(png|jpe?g|webp)$/i
+const macTrayIconPattern = /\.(ico|icns)$/i
+const GITHUB_PROXY_BUILTINS = [
+  'https://gh-proxy.org',
+  'https://ghfast.top',
+  'https://down.clashparty.org',
+  'https://download.mihomo.party'
+]
+type TrayIconCropTarget = 'custom' | keyof ICustomTrayIcons
+const customTrayIconStateKeys: (keyof ICustomTrayIcons)[] = ['off', 'sysProxy', 'tun']
 
 const GeneralConfig: React.FC = () => {
   const { t, i18n } = useTranslation()
@@ -47,6 +66,8 @@ const GeneralConfig: React.FC = () => {
   const [fetching, setFetching] = useState(false)
   const [isRelaunching, setIsRelaunching] = useState(false)
   const [trayIconCropDataURL, setTrayIconCropDataURL] = useState('')
+  const [trayIconCropTarget, setTrayIconCropTarget] = useState<TrayIconCropTarget>('custom')
+  const [trayIconDrawerOpen, setTrayIconDrawerOpen] = useState(false)
   const [showHardwareAccelConfirm, setShowHardwareAccelConfirm] = useState(false)
   const [pendingHardwareAccelValue, setPendingHardwareAccelValue] = useState(false)
   const { setTheme } = useTheme()
@@ -61,29 +82,122 @@ const GeneralConfig: React.FC = () => {
     swapTrayClick = false,
     disableTrayIconColor = false,
     customTrayIcon = '',
+    customTrayIcons = {},
     disableAnimations = false,
     showFloatingWindow: showFloating = false,
     spinFloatingIcon = true,
     floatingWindowCompatMode = true,
     disableHardwareAcceleration = false,
     useWindowFrame = false,
+    rememberSelectedSiderCard = false,
+    lockSiderCards = false,
     autoQuitWithoutCore = false,
     autoQuitWithoutCoreDelay = 60,
+    autoQuitWithoutCoreMode = 'core',
     customTheme = 'default.css',
     envType = [platform === 'win32' ? 'powershell' : 'bash'],
-    autoCheckUpdate,
+    autoCheckUpdate = true,
+    autoUpdateProfileOnStart = true,
+    silentUpdate = true,
     githubProxy = 'auto',
     appTheme = 'system',
     language = 'zh-CN',
     triggerMainWindowBehavior = 'show',
-    hideConnectionCardWave = false
+    hideConnectionCardWave = false,
+    disableAppLog = false
   } = appConfig || {}
+
+  const isCustomGithubProxy =
+    githubProxy !== 'auto' &&
+    githubProxy !== 'direct' &&
+    !GITHUB_PROXY_BUILTINS.includes(githubProxy)
+  const [customGithubProxy, setCustomGithubProxy] = useState(isCustomGithubProxy ? githubProxy : '')
+  const patchGithubProxy = debounce(async (v: string) => {
+    await patchAppConfig({ githubProxy: v })
+  }, 500)
+
+  useEffect(() => {
+    if (isCustomGithubProxy && customGithubProxy !== githubProxy) {
+      setCustomGithubProxy(githubProxy)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [githubProxy, isCustomGithubProxy])
 
   useEffect(() => {
     resolveThemes().then((themes) => {
       setCustomThemes(themes)
     })
   }, [])
+
+  const hasCustomTrayIcons = Boolean(customTrayIcon || Object.values(customTrayIcons).some(Boolean))
+
+  const getTrayIconDisplayText = (icon?: string): string => {
+    if (!icon) return t('common.default')
+    return icon.startsWith('data:image/') ? t('settings.customTrayIconBase64') : icon
+  }
+
+  const patchTrayIcon = async (target: TrayIconCropTarget, icon: string): Promise<void> => {
+    if (target === 'custom') {
+      await patchAppConfig({ customTrayIcon: icon })
+    } else {
+      await patchAppConfig({
+        customTrayIcons: {
+          ...customTrayIcons,
+          [target]: icon
+        }
+      })
+    }
+    await updateTrayIcon()
+  }
+
+  const selectTrayIcon = async (target: TrayIconCropTarget): Promise<void> => {
+    const files = await getFilePath(
+      ['png', 'jpg', 'jpeg', 'webp', 'ico', 'icns'],
+      t('settings.customTrayIconSelect'),
+      t('settings.customTrayIcon')
+    )
+    if (!files?.[0]) return
+    if (
+      rasterTrayIconPattern.test(files[0]) ||
+      (platform === 'darwin' && macTrayIconPattern.test(files[0]))
+    ) {
+      setTrayIconCropTarget(target)
+      setTrayIconCropDataURL(await readImageFileDataURL(files[0]))
+      return
+    }
+    await patchTrayIcon(target, files[0])
+  }
+
+  const resetTrayIcon = async (target: TrayIconCropTarget): Promise<void> => {
+    await patchTrayIcon(target, '')
+  }
+
+  const renderTrayIconPicker = (
+    target: TrayIconCropTarget,
+    label: string,
+    icon: string | undefined
+  ): React.ReactNode => (
+    <div
+      key={target}
+      className="grid min-w-0 grid-cols-[7rem_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md px-2 py-1.5"
+    >
+      <span className="shrink-0 text-sm text-default-600">{label}</span>
+      <span
+        className="min-w-0 truncate text-right text-xs text-default-500"
+        title={getTrayIconDisplayText(icon)}
+      >
+        {getTrayIconDisplayText(icon)}
+      </span>
+      <Button size="sm" variant="flat" onPress={() => selectTrayIcon(target)}>
+        {t(icon ? 'settings.changeTrayIcon' : 'settings.selectTrayIcon')}
+      </Button>
+      {icon && (
+        <Button size="sm" variant="light" onPress={() => resetTrayIcon(target)}>
+          {t('common.default')}
+        </Button>
+      )}
+    </div>
+  )
 
   return (
     <>
@@ -125,9 +239,8 @@ const GeneralConfig: React.FC = () => {
           imageDataURL={trayIconCropDataURL}
           onCancel={() => setTrayIconCropDataURL('')}
           onConfirm={async (dataURL) => {
-            await patchAppConfig({ customTrayIcon: dataURL })
+            await patchTrayIcon(trayIconCropTarget, dataURL)
             setTrayIconCropDataURL('')
-            await updateTrayIcon()
           }}
         />
       )}
@@ -180,6 +293,15 @@ const GeneralConfig: React.FC = () => {
             }}
           />
         </SettingItem>
+        <SettingItem title={t('settings.autoUpdateProfileOnStart')} divider>
+          <Switch
+            size="sm"
+            isSelected={autoUpdateProfileOnStart}
+            onValueChange={(v) => {
+              patchAppConfig({ autoUpdateProfileOnStart: v })
+            }}
+          />
+        </SettingItem>
         <SettingItem title={t('settings.autoCheckUpdate')} divider>
           <Switch
             size="sm"
@@ -189,24 +311,50 @@ const GeneralConfig: React.FC = () => {
             }}
           />
         </SettingItem>
+        <SettingItem title={t('settings.silentUpdate')} divider>
+          <Switch
+            size="sm"
+            isSelected={silentUpdate}
+            onValueChange={(v) => {
+              patchAppConfig({ silentUpdate: v })
+            }}
+          />
+        </SettingItem>
         <SettingItem title={t('settings.githubProxy')} divider>
           <Select
             classNames={{ trigger: 'data-[hover=true]:bg-default-200' }}
             className="w-50"
             size="sm"
-            selectedKeys={[githubProxy]}
+            selectedKeys={[isCustomGithubProxy ? 'custom' : githubProxy]}
             aria-label={t('settings.githubProxy')}
             onSelectionChange={(v) => {
-              patchAppConfig({ githubProxy: Array.from(v)[0] as string })
+              const key = Array.from(v)[0] as string
+              patchAppConfig({ githubProxy: key === 'custom' ? customGithubProxy : key })
             }}
           >
             <SelectItem key="auto">{t('settings.githubProxy.auto')}</SelectItem>
             <SelectItem key="direct">{t('settings.githubProxy.direct')}</SelectItem>
+            <SelectItem key="custom">{t('settings.githubProxy.custom')}</SelectItem>
             <SelectItem key="https://gh-proxy.org">gh-proxy.org</SelectItem>
             <SelectItem key="https://ghfast.top">ghfast.top</SelectItem>
             <SelectItem key="https://down.clashparty.org">down.clashparty.org</SelectItem>
+            <SelectItem key="https://download.mihomo.party">download.mihomo.party</SelectItem>
           </Select>
         </SettingItem>
+        {isCustomGithubProxy && (
+          <SettingItem title={t('settings.githubProxy.customAddress')} divider>
+            <Input
+              size="sm"
+              className="w-70"
+              value={customGithubProxy}
+              placeholder={t('settings.githubProxy.customPlaceholder')}
+              onValueChange={(v) => {
+                setCustomGithubProxy(v)
+                patchGithubProxy(v)
+              }}
+            />
+          </SettingItem>
+        )}
         <SettingItem title={t('settings.silentStart')} divider>
           <Switch
             size="sm"
@@ -236,27 +384,49 @@ const GeneralConfig: React.FC = () => {
           />
         </SettingItem>
         {autoQuitWithoutCore && (
-          <SettingItem title={t('settings.autoQuitWithoutCoreDelay')} divider>
-            <div className="flex items-center gap-2">
-              <Input
+          <>
+            <SettingItem title={t('settings.autoQuitWithoutCoreMode')} divider>
+              <Tabs
                 size="sm"
-                className="w-25"
-                type="number"
-                value={autoQuitWithoutCoreDelay.toString()}
-                onValueChange={async (v: string) => {
-                  const num = parseInt(v)
-                  await patchAppConfig({ autoQuitWithoutCoreDelay: num })
+                color="primary"
+                selectedKey={autoQuitWithoutCoreMode}
+                onSelectionChange={async (key) => {
+                  const mode = key as 'core' | 'tray'
+                  await patchAppConfig({ autoQuitWithoutCoreMode: mode })
+                  if (mode === 'core' && autoQuitWithoutCoreDelay < 5) {
+                    await patchAppConfig({ autoQuitWithoutCoreDelay: 5 })
+                  }
                 }}
-                onBlur={async (e) => {
-                  let num = parseInt(e.target.value)
-                  if (isNaN(num)) num = 5
-                  if (num < 5) num = 5
-                  await patchAppConfig({ autoQuitWithoutCoreDelay: num })
-                }}
-              />
-              <span className="text-default-500">{t('common.seconds')}</span>
-            </div>
-          </SettingItem>
+              >
+                <Tab key="core" title={t('settings.autoQuitWithoutCoreModeCore')} />
+                <Tab key="tray" title={t('settings.autoQuitWithoutCoreModeTray')} />
+              </Tabs>
+            </SettingItem>
+            <SettingItem title={t('settings.autoQuitWithoutCoreDelay')} divider>
+              <div className="flex items-center gap-2">
+                <Input
+                  size="sm"
+                  className="w-25"
+                  type="number"
+                  value={autoQuitWithoutCoreDelay.toString()}
+                  onValueChange={async (v: string) => {
+                    const num = parseInt(v)
+                    if (!isNaN(num)) {
+                      await patchAppConfig({ autoQuitWithoutCoreDelay: num })
+                    }
+                  }}
+                  onBlur={async (e) => {
+                    const minDelay = autoQuitWithoutCoreMode === 'core' ? 5 : 0
+                    let num = parseInt(e.target.value)
+                    if (isNaN(num)) num = minDelay
+                    if (num < minDelay) num = minDelay
+                    await patchAppConfig({ autoQuitWithoutCoreDelay: num })
+                  }}
+                />
+                <span className="text-default-500">{t('common.seconds')}</span>
+              </div>
+            </SettingItem>
+          </>
         )}
         <SettingItem
           title={t('settings.envType')}
@@ -346,20 +516,22 @@ const GeneralConfig: React.FC = () => {
             </SettingItem>
           </>
         )}
-        <SettingItem title={t('settings.disableTray')} divider>
-          <Switch
-            size="sm"
-            isSelected={disableTray}
-            onValueChange={async (v) => {
-              await patchAppConfig({ disableTray: v })
-              if (v) {
-                closeTrayIcon()
-              } else {
-                showTrayIcon()
-              }
-            }}
-          />
-        </SettingItem>
+        {showFloating && (
+          <SettingItem title={t('settings.disableTray')} divider>
+            <Switch
+              size="sm"
+              isSelected={disableTray}
+              onValueChange={async (v) => {
+                await patchAppConfig({ disableTray: v })
+                if (v) {
+                  closeTrayIcon()
+                } else {
+                  showTrayIcon()
+                }
+              }}
+            />
+          </SettingItem>
+        )}
         {!disableTray && (
           <>
             <SettingItem title={t('settings.swapTrayClick')} divider>
@@ -379,7 +551,7 @@ const GeneralConfig: React.FC = () => {
               <Switch
                 size="sm"
                 isSelected={disableTrayIconColor}
-                isDisabled={Boolean(customTrayIcon)}
+                isDisabled={hasCustomTrayIcons}
                 onValueChange={async (v) => {
                   await patchAppConfig({ disableTrayIconColor: v })
                   await updateTrayIcon()
@@ -395,57 +567,50 @@ const GeneralConfig: React.FC = () => {
                   </Button>
                 </Tooltip>
               }
-              divider
             >
-              <div className="flex items-center justify-end gap-2 min-w-0 max-w-[65%]">
-                {customTrayIcon && (
-                  <span
-                    className="truncate text-xs text-default-500"
-                    title={
-                      customTrayIcon.startsWith('data:image/')
-                        ? t('settings.customTrayIconBase64')
-                        : customTrayIcon
-                    }
-                  >
-                    {customTrayIcon.startsWith('data:image/')
-                      ? t('settings.customTrayIconBase64')
-                      : customTrayIcon}
-                  </span>
-                )}
-                <Button
-                  size="sm"
-                  variant="flat"
-                  onPress={async () => {
-                    const files = await getFilePath(
-                      ['png', 'jpg', 'jpeg', 'webp', 'ico', 'icns'],
-                      t('settings.customTrayIconSelect'),
-                      t('settings.customTrayIcon')
-                    )
-                    if (!files?.[0]) return
-                    if (rasterTrayIconPattern.test(files[0])) {
-                      setTrayIconCropDataURL(await readImageFileDataURL(files[0]))
-                      return
-                    }
-                    await patchAppConfig({ customTrayIcon: files[0] })
-                    await updateTrayIcon()
-                  }}
+              <div className="flex min-w-0 max-w-[68%] items-center justify-end gap-2">
+                <span
+                  className="min-w-0 truncate text-xs text-default-500"
+                  title={getTrayIconDisplayText(customTrayIcon)}
                 >
+                  {getTrayIconDisplayText(customTrayIcon)}
+                </span>
+                <Button size="sm" variant="flat" onPress={() => selectTrayIcon('custom')}>
                   {t(customTrayIcon ? 'settings.changeTrayIcon' : 'settings.selectTrayIcon')}
                 </Button>
                 {customTrayIcon && (
-                  <Button
-                    size="sm"
-                    variant="light"
-                    onPress={async () => {
-                      await patchAppConfig({ customTrayIcon: '' })
-                      await updateTrayIcon()
-                    }}
-                  >
+                  <Button size="sm" variant="light" onPress={() => resetTrayIcon('custom')}>
                     {t('common.default')}
                   </Button>
                 )}
+                <Button
+                  size="sm"
+                  variant="light"
+                  endContent={
+                    <IoIosArrowDown
+                      className={`text-sm transition-transform ${trayIconDrawerOpen ? 'rotate-180' : ''}`}
+                    />
+                  }
+                  onPress={() => setTrayIconDrawerOpen((v) => !v)}
+                >
+                  {t('settings.customTrayIconStates')}
+                </Button>
               </div>
             </SettingItem>
+            {trayIconDrawerOpen && (
+              <div className="mb-2 ml-4 mr-1 mt-2 rounded-lg border border-default-200 bg-default-50/40 p-2">
+                <div className="flex flex-col gap-1">
+                  {customTrayIconStateKeys.map((key) =>
+                    renderTrayIconPicker(
+                      key,
+                      t(`settings.customTrayIcon.${key}`),
+                      customTrayIcons[key]
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+            <Divider className="my-2" />
           </>
         )}
         {platform !== 'linux' && (
@@ -534,12 +699,39 @@ const GeneralConfig: React.FC = () => {
             }, 1000)}
           />
         </SettingItem>
+        <SettingItem title={t('settings.rememberSelectedSiderCard')} divider>
+          <Switch
+            size="sm"
+            isSelected={rememberSelectedSiderCard}
+            onValueChange={async (v) => {
+              await patchAppConfig({ rememberSelectedSiderCard: v })
+            }}
+          />
+        </SettingItem>
+        <SettingItem title={t('settings.lockSiderCards')} divider>
+          <Switch
+            size="sm"
+            isSelected={lockSiderCards}
+            onValueChange={async (v) => {
+              await patchAppConfig({ lockSiderCards: v })
+            }}
+          />
+        </SettingItem>
         <SettingItem title={t('settings.disableAnimations')} divider>
           <Switch
             size="sm"
             isSelected={disableAnimations}
             onValueChange={async (v) => {
               await patchAppConfig({ disableAnimations: v })
+            }}
+          />
+        </SettingItem>
+        <SettingItem title={t('settings.disableAppLog')} divider>
+          <Switch
+            size="sm"
+            isSelected={disableAppLog}
+            onValueChange={async (v) => {
+              await patchAppConfig({ disableAppLog: v })
             }}
           />
         </SettingItem>

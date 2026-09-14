@@ -14,7 +14,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from '@renderer/components/base/toast'
 import { getProfileStr, setProfileStr } from '@renderer/utils/ipc'
 import { isValidListenAddressFull } from '@renderer/utils/validate'
-import yaml from 'js-yaml'
+import { dump, load } from 'js-yaml'
 import { useTranslation } from 'react-i18next'
 import { IoMdCreate, IoMdTrash, IoMdUndo } from 'react-icons/io'
 
@@ -31,6 +31,12 @@ interface TunnelItem {
 }
 
 type ProfileYaml = Record<string, unknown>
+
+const toStringValue = (value: unknown): string => {
+  if (typeof value === 'string') return value
+  if (value === null || value === undefined) return ''
+  return String(value)
+}
 
 const defaultTunnel: TunnelItem = {
   network: ['tcp'],
@@ -64,9 +70,9 @@ const parseTunnelString = (value: string): TunnelItem | undefined => {
 
   return {
     network,
-    address: parts[1],
-    target: parts[2],
-    proxy: parts[3] || ''
+    address: toStringValue(parts[1]),
+    target: toStringValue(parts[2]),
+    proxy: toStringValue(parts[3])
   }
 }
 
@@ -188,6 +194,9 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
   const [newTunnel, setNewTunnel] = useState<TunnelItem>(defaultTunnel)
   const [editingIndex, setEditingIndex] = useState<number | undefined>()
   const [isLoading, setIsLoading] = useState(true)
+  // 保存会整份重写订阅文件，所以只要没成功读到原文就绝不允许保存，
+  // 否则 profile 还是初始的 {}，一保存就把用户的订阅内容清空。
+  const [loadFailed, setLoadFailed] = useState(false)
 
   const addressInvalid = useMemo(() => {
     if (!newTunnel.address.trim()) return false
@@ -204,14 +213,21 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
   useEffect(() => {
     const loadContent = async (): Promise<void> => {
       setIsLoading(true)
+      setLoadFailed(false)
       try {
         const content = await getProfileStr(id)
-        const parsed = yaml.load(content)
-        const nextProfile = parsed && typeof parsed === 'object' ? (parsed as ProfileYaml) : {}
+        const parsed = load(content)
+        // 解析结果不是 YAML mapping 时（例如 age 密文、根数组或日期），
+        // 旧实现静默退化成 {} 且不提示，保存就会把整份订阅写没。
+        if (Object.prototype.toString.call(parsed) !== '[object Object]') {
+          throw new Error('Profile is not a YAML mapping')
+        }
+        const nextProfile = parsed as ProfileYaml
         setProfile(nextProfile)
         setTunnels(parseTunnels(nextProfile.tunnels))
         setProxyNames(collectProxyNames(nextProfile))
       } catch (e) {
+        setLoadFailed(true)
         toast.error(
           t('profiles.editTunnels.loadError') + ': ' + (e instanceof Error ? e.message : String(e))
         )
@@ -276,6 +292,9 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
   }
 
   const handleSave = async (): Promise<void> => {
+    // 原文没读到就直接拒绝写回，避免用空对象覆盖订阅
+    if (isLoading || loadFailed) return
+
     try {
       const nextProfile: ProfileYaml = { ...profile }
       if (tunnels.length > 0) {
@@ -284,7 +303,7 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
         delete nextProfile.tunnels
       }
 
-      await setProfileStr(id, yaml.dump(nextProfile))
+      await setProfileStr(id, dump(nextProfile))
       onClose()
     } catch (e) {
       toast.error(
@@ -335,7 +354,9 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
                   label={t('profiles.editTunnels.address')}
                   placeholder="127.0.0.1:7777"
                   value={newTunnel.address}
-                  onValueChange={(value) => setNewTunnel({ ...newTunnel, address: value })}
+                  onValueChange={(value) =>
+                    setNewTunnel((prev) => ({ ...prev, address: toStringValue(value) }))
+                  }
                 />
                 {addressInvalid && (
                   <div className="-mt-2 px-1 text-xs text-danger">
@@ -346,7 +367,9 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
                   label={t('profiles.editTunnels.target')}
                   placeholder="target.com:443"
                   value={newTunnel.target}
-                  onValueChange={(value) => setNewTunnel({ ...newTunnel, target: value })}
+                  onValueChange={(value) =>
+                    setNewTunnel((prev) => ({ ...prev, target: toStringValue(value) }))
+                  }
                 />
                 {targetInvalid && (
                   <div className="-mt-2 px-1 text-xs text-danger">
@@ -357,11 +380,13 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
                   label={t('profiles.editTunnels.proxy')}
                   placeholder={t('profiles.editTunnels.proxyPlaceholder')}
                   selectedKey={newTunnel.proxy || null}
-                  inputValue={newTunnel.proxy}
+                  inputValue={newTunnel.proxy || ''}
                   onSelectionChange={(key) =>
-                    setNewTunnel({ ...newTunnel, proxy: key ? String(key) : '' })
+                    setNewTunnel((prev) => ({ ...prev, proxy: toStringValue(key) }))
                   }
-                  onInputChange={(value) => setNewTunnel({ ...newTunnel, proxy: value })}
+                  onInputChange={(value) =>
+                    setNewTunnel((prev) => ({ ...prev, proxy: toStringValue(value) }))
+                  }
                 >
                   {proxyNames.map((proxy) => (
                     <AutocompleteItem key={proxy} textValue={proxy}>
@@ -462,7 +487,12 @@ const EditTunnelsModal: React.FC<Props> = (props) => {
           <Button size="sm" variant="light" onPress={onClose}>
             {t('common.cancel')}
           </Button>
-          <Button size="sm" color="primary" onPress={handleSave}>
+          <Button
+            size="sm"
+            color="primary"
+            isDisabled={isLoading || loadFailed}
+            onPress={handleSave}
+          >
             {t('common.save')}
           </Button>
         </ModalFooter>

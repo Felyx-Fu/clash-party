@@ -13,12 +13,17 @@ import { AppConfigProvider } from './hooks/use-app-config'
 import { ControledMihomoConfigProvider } from './hooks/use-controled-mihomo-config'
 import { OverrideConfigProvider } from './hooks/use-override-config'
 import { ProfileConfigProvider } from './hooks/use-profile-config'
+import { PluginConfigProvider } from './hooks/use-plugin-config'
 import { RulesProvider } from './hooks/use-rules'
 import { GroupsProvider } from './hooks/use-groups'
 import { ToastProvider } from './components/base/toast'
 import './i18n'
 
 let F12Count = 0
+
+if (!window.location.hash) {
+  window.history.replaceState(null, '', '#/proxies')
+}
 
 init().then(() => {
   document.addEventListener('keydown', (e) => {
@@ -52,15 +57,17 @@ init().then(() => {
               <AppConfigProvider>
                 <ControledMihomoConfigProvider>
                   <ProfileConfigProvider>
-                    <OverrideConfigProvider>
-                      <GroupsProvider>
-                        <RulesProvider>
-                          <ToastProvider>
-                            <App />
-                          </ToastProvider>
-                        </RulesProvider>
-                      </GroupsProvider>
-                    </OverrideConfigProvider>
+                    <PluginConfigProvider>
+                      <OverrideConfigProvider>
+                        <GroupsProvider>
+                          <RulesProvider>
+                            <ToastProvider>
+                              <App />
+                            </ToastProvider>
+                          </RulesProvider>
+                        </GroupsProvider>
+                      </OverrideConfigProvider>
+                    </PluginConfigProvider>
                   </ProfileConfigProvider>
                 </ControledMihomoConfigProvider>
               </AppConfigProvider>

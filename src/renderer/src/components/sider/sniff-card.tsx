@@ -1,6 +1,6 @@
 import { Button, Card, CardBody, CardFooter, Tooltip } from '@heroui/react'
 import { toast } from '@renderer/components/base/toast'
-import BorderSwitch from '@renderer/components/base/border-swtich'
+import BorderSwitch from '@renderer/components/base/border-switch'
 import { RiScan2Fill } from 'react-icons/ri'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { mihomoHotReloadConfig } from '@renderer/utils/ipc'
@@ -9,6 +9,7 @@ import { CSS } from '@dnd-kit/utilities'
 import { useAppConfig } from '@renderer/hooks/use-app-config'
 import React from 'react'
 import { useTranslation } from 'react-i18next'
+import { DEFAULT_CONTROL_SNIFF } from '../../../../shared/appConfig'
 
 interface Props {
   iconOnly?: boolean
@@ -19,7 +20,7 @@ const SniffCard: React.FC<Props> = (props) => {
   const { iconOnly } = props
   const {
     sniffCardStatus = 'col-span-1',
-    controlSniff = true,
+    controlSniff = DEFAULT_CONTROL_SNIFF,
     disableAnimations = false
   } = appConfig || {}
   const location = useLocation()

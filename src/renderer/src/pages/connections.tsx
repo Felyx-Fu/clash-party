@@ -44,7 +44,29 @@ import { useControledMihomoConfig } from '@renderer/hooks/use-controled-mihomo-c
 
 let cachedConnections: IMihomoConnectionDetail[] = []
 const MAX_QUEUE_SIZE = 100
+// 按进程路径累积的内存缓存封顶，避免长时间运行无界增长
+const MAX_ICON_CACHE_SIZE = 256
+const MAX_APP_NAME_CACHE_SIZE = 512
 const CONNECTIONS_FILTER_KEY = 'connections-filter'
+
+function putCappedRecord<T>(
+  prev: Record<string, T>,
+  key: string,
+  value: T,
+  max: number
+): Record<string, T> {
+  if (max <= 0) return {}
+  const next: Record<string, T> = { ...prev, [key]: value }
+  const keys = Object.keys(next)
+  const overflow = keys.length - max
+  for (let i = 0, removed = 0; removed < overflow && i < keys.length; i++) {
+    if (keys[i] !== key) {
+      delete next[keys[i]]
+      removed++
+    }
+  }
+  return next
+}
 
 const Connections: React.FC = () => {
   const { t } = useTranslation()
@@ -90,6 +112,29 @@ const Connections: React.FC = () => {
   const appNameRequestQueue = useRef(new Set<string>())
   const processingAppNames = useRef(new Set<string>())
   const processAppNameTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const otherPathsTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mountedRef = useRef(false)
+
+  useEffect(() => {
+    const iconQueue = iconRequestQueue.current
+    const activeIcons = processingIcons.current
+    const appNameQueue = appNameRequestQueue.current
+    const activeAppNames = processingAppNames.current
+
+    mountedRef.current = true
+    return (): void => {
+      mountedRef.current = false
+      if (processIconTimer.current) clearTimeout(processIconTimer.current)
+      if (processIconIdleCallback.current) cancelIdleCallback(processIconIdleCallback.current)
+      if (processAppNameTimer.current) clearTimeout(processAppNameTimer.current)
+      if (otherPathsTimer.current) clearTimeout(otherPathsTimer.current)
+      iconQueue.clear()
+      activeIcons.clear()
+      appNameQueue.clear()
+      activeAppNames.clear()
+    }
+  }, [])
+
   useEffect(() => {
     activeConnectionsRef.current = activeConnections
     allConnectionsRef.current = allConnections
@@ -217,7 +262,12 @@ const Connections: React.FC = () => {
   }
 
   const processAppNameQueue = useCallback(async () => {
-    if (processingAppNames.current.size >= 3 || appNameRequestQueue.current.size === 0) return
+    if (
+      !mountedRef.current ||
+      processingAppNames.current.size >= 3 ||
+      appNameRequestQueue.current.size === 0
+    )
+      return
 
     const pathsToProcess = Array.from(appNameRequestQueue.current).slice(0, 3)
     pathsToProcess.forEach((path) => appNameRequestQueue.current.delete(path))
@@ -228,8 +278,8 @@ const Connections: React.FC = () => {
 
       try {
         const appName = await getAppName(path)
-        if (appName) {
-          setAppNameCache((prev) => ({ ...prev, [path]: appName }))
+        if (appName && mountedRef.current) {
+          setAppNameCache((prev) => putCappedRecord(prev, path, appName, MAX_APP_NAME_CACHE_SIZE))
         }
       } catch {
         // ignore
@@ -240,13 +290,18 @@ const Connections: React.FC = () => {
 
     await Promise.all(promises)
 
-    if (appNameRequestQueue.current.size > 0) {
+    if (mountedRef.current && appNameRequestQueue.current.size > 0) {
       processAppNameTimer.current = setTimeout(processAppNameQueue, 100)
     }
   }, [])
 
   const processIconQueue = useCallback(async () => {
-    if (processingIcons.current.size >= 5 || iconRequestQueue.current.size === 0) return
+    if (
+      !mountedRef.current ||
+      processingIcons.current.size >= 5 ||
+      iconRequestQueue.current.size === 0
+    )
+      return
 
     const pathsToProcess = Array.from(iconRequestQueue.current).slice(0, 5)
     pathsToProcess.forEach((path) => iconRequestQueue.current.delete(path))
@@ -268,9 +323,11 @@ const Connections: React.FC = () => {
           processedDataURL = await cropAndPadTransparent(fullDataURL)
         }
 
+        if (!mountedRef.current) return
+
         saveIconToCache(path, processedDataURL)
 
-        setIconMap((prev) => ({ ...prev, [path]: processedDataURL }))
+        setIconMap((prev) => putCappedRecord(prev, path, processedDataURL, MAX_ICON_CACHE_SIZE))
 
         const firstConnection = filteredConnectionsRef.current[0]
         if (firstConnection?.metadata.processPath === path) {
@@ -285,7 +342,7 @@ const Connections: React.FC = () => {
 
     await Promise.all(promises)
 
-    if (iconRequestQueue.current.size > 0) {
+    if (mountedRef.current && iconRequestQueue.current.size > 0) {
       if ('requestIdleCallback' in window) {
         processIconIdleCallback.current = requestIdleCallback(() => processIconQueue(), {
           timeout: 1000
@@ -327,7 +384,7 @@ const Connections: React.FC = () => {
 
       const fromCache = getIconFromCache(path)
       if (fromCache) {
-        setIconMap((prev) => ({ ...prev, [path]: fromCache }))
+        setIconMap((prev) => putCappedRecord(prev, path, fromCache, MAX_ICON_CACHE_SIZE))
         if (isVisible && filteredConnections[0]?.metadata.processPath === path) {
           setFirstItemRefreshTrigger((prev) => prev + 1)
         }
@@ -350,13 +407,17 @@ const Connections: React.FC = () => {
 
     if (otherPaths.size > 0) {
       const loadOtherPaths = () => {
+        if (!mountedRef.current) return
         otherPaths.forEach((path) => {
           loadIcon(path, false)
           if (displayAppName) loadAppName(path)
         })
       }
 
-      setTimeout(loadOtherPaths, 100)
+      otherPathsTimer.current = setTimeout(() => {
+        otherPathsTimer.current = null
+        loadOtherPaths()
+      }, 100)
     }
 
     if (processIconTimer.current) clearTimeout(processIconTimer.current)
@@ -372,6 +433,7 @@ const Connections: React.FC = () => {
       if (processIconTimer.current) clearTimeout(processIconTimer.current)
       if (processIconIdleCallback.current) cancelIdleCallback(processIconIdleCallback.current)
       if (processAppNameTimer.current) clearTimeout(processAppNameTimer.current)
+      if (otherPathsTimer.current) clearTimeout(otherPathsTimer.current)
     }
   }, [
     activeConnections,
@@ -387,8 +449,10 @@ const Connections: React.FC = () => {
   ])
 
   useEffect(() => {
-    const handler = (_e: unknown, ...args: unknown[]): void => {
-      const info = args[0] as IMihomoConnectionsInfo
+    let pendingInfo: IMihomoConnectionsInfo | undefined
+    let frameId: number | undefined
+
+    const updateConnections = (info: IMihomoConnectionsInfo): void => {
       setConnectionsInfo(info)
 
       if (!info.connections) return
@@ -425,12 +489,29 @@ const Connections: React.FC = () => {
       cachedConnections = sliced
     }
 
+    const handler = (_e: unknown, ...args: unknown[]): void => {
+      const info = args[0] as IMihomoConnectionsInfo | undefined
+      if (!info || document.hidden) return
+
+      pendingInfo = info
+      if (frameId !== undefined) return
+      frameId = window.requestAnimationFrame(() => {
+        frameId = undefined
+        const latestInfo = pendingInfo
+        pendingInfo = undefined
+        if (latestInfo && !document.hidden) updateConnections(latestInfo)
+      })
+    }
+
+    let unsubscribe: (() => void) | null = null
     if (!isPaused) {
-      window.electron.ipcRenderer.on('mihomoConnections', handler)
+      unsubscribe = window.electron.ipcRenderer.on('mihomoConnections', handler)
     }
 
     return (): void => {
-      window.electron.ipcRenderer.removeListener('mihomoConnections', handler)
+      unsubscribe?.()
+      if (frameId !== undefined) window.cancelAnimationFrame(frameId)
+      pendingInfo = undefined
     }
   }, [isPaused])
 
@@ -655,11 +736,7 @@ const Connections: React.FC = () => {
                 onSelectionChange={async (v) => {
                   await patchAppConfig({
                     connectionOrderBy: v.currentKey as
-                      | 'time'
-                      | 'upload'
-                      | 'download'
-                      | 'uploadSpeed'
-                      | 'downloadSpeed'
+                      'time' | 'upload' | 'download' | 'uploadSpeed' | 'downloadSpeed'
                   })
                 }}
               >

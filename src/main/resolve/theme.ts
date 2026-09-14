@@ -1,4 +1,4 @@
-import { copyFile, readdir, readFile, writeFile } from 'fs/promises'
+import { copyFile, readdir, readFile } from 'fs/promises'
 import path from 'path'
 import { existsSync } from 'fs'
 import AdmZip from 'adm-zip'
@@ -6,7 +6,9 @@ import { t } from 'i18next'
 import { themesDir } from '../utils/dirs'
 import * as chromeRequest from '../utils/chromeRequest'
 import { getControledMihomoConfig } from '../config'
+import { DEFAULT_MIHOMO_PORTS } from '../../shared/appConfig'
 import { mainWindow } from '../window'
+import { atomicWriteFile } from '../utils/safeFile'
 import { floatingWindow } from './floatingWindow'
 
 let insertedCSSKeyMain: string | undefined = undefined
@@ -35,7 +37,7 @@ export async function resolveThemes(): Promise<{ key: string; label: string }[]>
 
 export async function fetchThemes(): Promise<void> {
   const zipUrl = 'https://github.com/mihomo-party-org/theme-hub/releases/download/latest/themes.zip'
-  const { 'mixed-port': mixedPort = 7890 } = await getControledMihomoConfig()
+  const { 'mixed-port': mixedPort = DEFAULT_MIHOMO_PORTS.mixed } = await getControledMihomoConfig()
   const zipData = await chromeRequest.get(zipUrl, {
     responseType: 'arraybuffer',
     headers: { 'Content-Type': 'application/octet-stream' },
@@ -65,7 +67,7 @@ export async function readTheme(theme: string): Promise<string> {
 }
 
 export async function writeTheme(theme: string, css: string): Promise<void> {
-  await writeFile(path.join(themesDir(), theme), css)
+  await atomicWriteFile(path.join(themesDir(), theme), css)
 }
 
 export async function applyTheme(theme: string): Promise<void> {
