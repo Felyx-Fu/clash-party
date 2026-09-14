@@ -151,11 +151,12 @@ function setupWindowEvents(window: BrowserWindow, config: WindowConfig): void {
       useDockIcon = true
     } = await getAppConfig()
 
-    if (!useDockIcon && !window.isVisible()) {
+    const windowIsVisible = window.isVisible()
+    if (!useDockIcon && !windowIsVisible) {
       hideDockIcon()
     }
 
-    if (autoQuitWithoutCore) {
+    if (autoQuitWithoutCore && !windowIsVisible) {
       scheduleQuitWithoutCore(autoQuitWithoutCoreDelay)
     }
   })
